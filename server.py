@@ -41,6 +41,7 @@ executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 1)
 
 # --- Database Configuration ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
+print('Database URL: ',DATABASE_URL)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # New environment variable for OpenAI
 
