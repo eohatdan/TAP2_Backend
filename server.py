@@ -1,6 +1,7 @@
 # server.py
 
 import os
+import re
 import requests
 import uuid
 import logging
@@ -11,52 +12,47 @@ import asyncio
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, text, Column, String
+from sqlalchemy import create_engine, text, Column, String, or_
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.exc import OperationalError
 
-# A key dependency for vector embeddings
+# Vector embeddings
 from pgvector.sqlalchemy import Vector
 
-# --- RAG Specific Dependencies ---
+# RAG deps
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
-import openai  # Added for a potential OpenAI LLM integration
+import openai
 
-# --- Logging Configuration ---
+# --- Logging ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Global Embedding Model ---
+# --- Globals ---
 embedding_model = None
-
-# --- LLM Models/Clients ---
 gemini_model = None
 openai_client = None
 
-# --- Thread Pool Executor for Blocking DB Calls ---
+# Thread pool for blocking DB operations
 executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 1)
 
-# --- Database Configuration ---
+# --- Config / Env ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
-print("Database URL: ", DATABASE_URL)
+print("Database URL:", DATABASE_URL)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # New environment variable for OpenAI
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "").strip().lower()  # optional: 'openai' or 'gemini'
 
 if not DATABASE_URL:
     logger.error("DATABASE_URL environment variable not set.")
 
-# SQLAlchemy setup
+# --- SQLAlchemy ---
 Base = declarative_base()
-
-# Create a database engine
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-
-# Create a session local class for database interactions
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# --- Database Models ---
+# --- Model ---
 class Paper(Base):
     __tablename__ = "papers"
 
@@ -65,12 +61,51 @@ class Paper(Base):
     abstract = Column(String)
     authors = Column(String)
     url = Column(String)
-
-    # NOTE: remains 384d to match all-MiniLM-L6-v2 (no schema change required)
+    # Keep 384 dims to match MiniLM/bge-small/e5-small families (no schema change)
     embedding = Column(Vector(384))
 
+# --- FastAPI app ---
+app = FastAPI(
+    title="The Aboutness Project Backend API",
+    description="API for semantic search and RAG for academic papers.",
+    version="0.3.0",
+)
 
-# --- Dependency to get a database session ---
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://eohatdan.github.io"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Utils ---
+
+def chunk_text_words(text: str, size: int = 1000, overlap: int = 200) -> List[str]:
+    """
+    Simple word-based chunking with overlap to keep relationships local.
+    """
+    words = text.split()
+    if not words:
+        return []
+    chunks = []
+    i = 0
+    step = max(1, size - overlap)
+    while i < len(words):
+        chunk = " ".join(words[i:i+size])
+        chunks.append(chunk)
+        i += step
+    return chunks
+
+def tokenize_query_for_keywords(q: str) -> List[str]:
+    """
+    Extract simple keywords (alnum + apostrophes) and drop very short tokens.
+    """
+    toks = re.findall(r"[A-Za-z0-9']+", q.lower())
+    return [t for t in toks if len(t) >= 3]
+
+# --- Dependencies ---
 def get_db():
     db = SessionLocal()
     try:
@@ -78,50 +113,27 @@ def get_db():
     finally:
         db.close()
 
-
-# --- FastAPI Application ---
-app = FastAPI(
-    title="The Aboutness Project Backend API",
-    description="API for semantic search and RAG for academic papers.",
-    version="0.2.0",
-)
-
-# --- CORS Middleware Configuration ---
-origins = [
-    "https://eohatdan.github.io",
-    # Add other origins if needed
-]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-# --- End CORS Middleware ---
-
-
+# --- Startup ---
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Backend application starting up...")
+    logger.info("Backend starting...")
 
     try:
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
-        logger.info("Successfully connected to the database!")
+        logger.info("DB connection OK")
     except OperationalError as e:
-        logger.error(f"Database connection failed on startup: {e}")
+        logger.error(f"DB connection failed: {e}")
         raise HTTPException(status_code=500, detail=f"Database connection failed: {e}")
 
     global embedding_model
     try:
-        logger.info("Loading Sentence-Transformer model...")
-        # Keeping your original model for now (384d)
+        logger.info("Loading embedding model...")
+        # 384-dim model to match schema; feel free to switch to 'bge-small-en-v1.5'
         embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-        logger.info("Embedding model loaded successfully!")
+        logger.info("Embedding model loaded.")
     except Exception as e:
-        logger.error(f"Error loading embedding model: {e}")
+        logger.error(f"Embedding model load error: {e}")
         raise HTTPException(status_code=500, detail="Failed to load embedding model.")
 
     global gemini_model
@@ -129,14 +141,12 @@ async def startup_event():
         try:
             genai.configure(api_key=GEMINI_API_KEY)
             gemini_model = genai.GenerativeModel("gemini-2.0-flash")
-            logger.info("Gemini LLM model initialized.")
+            logger.info("Gemini initialized.")
         except Exception as e:
-            logger.error(f"Error initializing Gemini LLM: {e}")
+            logger.error(f"Gemini init error: {e}")
             gemini_model = None
-            logger.warning("Gemini LLM will not be available due to initialization error.")
     else:
-        logger.warning("GEMINI_API_KEY not found. Gemini LLM will not be available.")
-        gemini_model = None
+        logger.info("No GEMINI_API_KEY; Gemini disabled.")
 
     global openai_client
     if OPENAI_API_KEY:
@@ -144,21 +154,18 @@ async def startup_event():
             openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
             logger.info("OpenAI client initialized.")
         except Exception as e:
-            logger.error(f"Error initializing OpenAI client: {e}")
+            logger.error(f"OpenAI init error: {e}")
             openai_client = None
-            logger.warning("OpenAI client will not be available due to initialization error.")
     else:
-        logger.warning("OPENAI_API_KEY not found. OpenAI client will not be available.")
-        openai_client = None
+        logger.info("No OPENAI_API_KEY; OpenAI disabled.")
 
     Base.metadata.create_all(bind=engine)
-    logger.info("Database schema validated/created.")
+    logger.info("Schema ensured.")
 
-
+# --- Root / Health ---
 @app.get("/")
 async def read_root():
     return {"message": "Welcome to The Aboutness Project Backend API!"}
-
 
 @app.get("/health")
 async def health_check(db: SessionLocal = Depends(get_db)):
@@ -166,143 +173,114 @@ async def health_check(db: SessionLocal = Depends(get_db)):
         db.execute(text("SELECT 1"))
         return {"status": "ok", "database_connection": "successful"}
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database connection failed: {e}",
-        )
+        raise HTTPException(status_code=500, detail=f"Database connection failed: {e}")
 
-
-# Optional convenience: check which LLMs are active
 @app.get("/which-llm")
 async def which_llm():
+    # Provider preference (if set) + availability
+    preferred = LLM_PROVIDER or ("gemini" if gemini_model else ("openai" if openai_client else "none"))
     return {
         "gemini_active": gemini_model is not None,
         "openai_active": openai_client is not None,
+        "preferred": preferred,
     }
 
+# --- Ingestion ---
 
-# --- Ingestion Endpoints ---
+class IngestGistFileRequest(BaseModel):
+    gist_id: str
+    filename: str
 
 @app.post("/bulk-load-gist", status_code=status.HTTP_201_CREATED)
 async def bulk_load_gist(gist_id: str, db: SessionLocal = Depends(get_db)):
     """
     Drops all existing data, fetches content from a multi-file Gist,
-    and ingests each file as a separate document.
+    CHUNKS each file, and ingests each chunk as a separate row.
     """
     global embedding_model
     if embedding_model is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Embedding model not loaded.",
-        )
+        raise HTTPException(status_code=500, detail="Embedding model not loaded.")
 
-    # 1. Drop all existing data
-    logger.info("Dropping existing 'papers' table to prepare for bulk load...")
+    # Reset table
+    logger.info("Dropping and recreating 'papers' for bulk load...")
     try:
         Base.metadata.drop_all(bind=engine)
-        Base.metadata.create_all(bind=engine)  # Re-create the table
-        logger.info("Existing 'papers' table dropped and re-created.")
+        Base.metadata.create_all(bind=engine)
+        logger.info("'papers' table reset.")
     except Exception as e:
         db.rollback()
-        logger.error(f"Failed to drop/re-create table: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to reset database: {e}",
-        )
+        logger.error(f"Failed to reset table: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to reset database: {e}")
 
-    # 2. Fetch Gist metadata to get file URLs
-    logger.info(f"Fetching Gist metadata for ID: {gist_id}...")
+    # Fetch gist metadata
     api_url = f"https://api.github.com/gists/{gist_id}"
+    logger.info(f"Fetching gist metadata: {api_url}")
     try:
         response = requests.get(api_url)
         response.raise_for_status()
         gist_data = response.json()
         files = gist_data.get("files", {})
     except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch Gist metadata: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch Gist metadata: {e}",
-        )
+        logger.error(f"Gist fetch error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch Gist metadata: {e}")
 
-    papers_to_ingest: List[Paper] = []
     if not files:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No files found in the specified Gist.",
-        )
+        raise HTTPException(status_code=404, detail="No files found in the specified Gist.")
 
-    # 3. Process and embed each file in the Gist (whole-file embedding, unchanged)
+    to_ingest: List[Paper] = []
+
     for filename, file_info in files.items():
         raw_url = file_info.get("raw_url")
         if not raw_url:
-            logger.warning(f"File '{filename}' in Gist has no raw_url. Skipping.")
+            logger.warning(f"File '{filename}' has no raw_url; skipping.")
             continue
 
-        logger.info(f"Fetching content for file: '{filename}' from URL: {raw_url}")
+        logger.info(f"Fetching file: {filename}")
         try:
-            content_response = requests.get(raw_url)
-            content_response.raise_for_status()
-            content = content_response.text
+            content_resp = requests.get(raw_url)
+            content_resp.raise_for_status()
+            content = content_resp.text
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch content from {raw_url}: {e}")
+            logger.error(f"Content fetch error for {raw_url}: {e}")
             continue
 
-        embedding = embedding_model.encode(content).tolist()
+        # --- CHUNKING ---
+        chunks = chunk_text_words(content, size=1000, overlap=200)
+        if not chunks:
+            # fallback: at least create one chunk if empty split
+            chunks = [content]
 
-        paper_entry = Paper(
-            title=filename,          # Use filename as title for Gist files
-            abstract=content,        # Use content as abstract
-            authors="Gist User",     # Placeholder
-            url=raw_url,
-            embedding=embedding,
-        )
-        papers_to_ingest.append(paper_entry)
+        for i, chunk in enumerate(chunks):
+            emb = embedding_model.encode(chunk).tolist()
+            to_ingest.append(
+                Paper(
+                    title=f"{filename}::chunk_{i:03d}",
+                    abstract=chunk,
+                    authors="Gist User",
+                    url=raw_url,
+                    embedding=emb,
+                )
+            )
 
-    # 4. Store all data in the database
-    logger.info(f"Ingesting {len(papers_to_ingest)} documents into the database...")
+    logger.info(f"Ingesting {len(to_ingest)} chunks...")
     try:
-        db.bulk_save_objects(papers_to_ingest)
+        db.bulk_save_objects(to_ingest)
         db.commit()
     except Exception as e:
         db.rollback()
-        logger.error(f"Database ingestion failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database ingestion failed: {e}",
-        )
+        logger.error(f"Ingestion failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Database ingestion failed: {e}")
 
-    return {
-        "message": f"Successfully loaded and ingested {len(papers_to_ingest)} documents.",
-        "documents_ingested": len(papers_to_ingest),
-    }
-
-
-# --- RAG Query Models ---
-class QueryRequest(BaseModel):
-    query: str
-    limit: int = 5  # Number of relevant documents to retrieve
-
-
-# --- New Ingestion Endpoint for a Single Gist file ---
-class IngestGistFileRequest(BaseModel):
-    gist_id: str
-    filename: str
-
+    return {"message": f"Ingested {len(to_ingest)} chunks from gist {gist_id}.", "chunks_ingested": len(to_ingest)}
 
 @app.post("/ingest-gist-file", status_code=status.HTTP_201_CREATED)
-async def ingest_gist_file(
-    request_body: IngestGistFileRequest, db: SessionLocal = Depends(get_db)
-):
+async def ingest_gist_file(request_body: IngestGistFileRequest, db: SessionLocal = Depends(get_db)):
     """
-    Fetches a single file from a Gist, embeds its content, and ingests it.
+    Fetches a single file from a Gist, CHUNKS it, and ingests chunks.
     """
     global embedding_model
     if embedding_model is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Embedding model not loaded.",
-        )
+        raise HTTPException(status_code=500, detail="Embedding model not loaded.")
 
     api_url = f"https://api.github.com/gists/{request_body.gist_id}"
     try:
@@ -311,131 +289,156 @@ async def ingest_gist_file(
         gist_data = response.json()
         files = gist_data.get("files", {})
     except requests.exceptions.RequestException as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch Gist metadata: {e}",
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to fetch Gist metadata: {e}")
 
     file_info = files.get(request_body.filename)
     if not file_info:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"File '{request_body.filename}' not found in the specified Gist.",
-        )
+        raise HTTPException(status_code=404, detail=f"File '{request_body.filename}' not found in the gist.")
 
     raw_url = file_info.get("raw_url")
     if not raw_url:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Raw URL not found for file '{request_body.filename}'.",
-        )
+        raise HTTPException(status_code=500, detail=f"Raw URL not found for '{request_body.filename}'.")
 
     try:
         content_response = requests.get(raw_url)
         content_response.raise_for_status()
         content = content_response.text
     except requests.exceptions.RequestException as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch content from {raw_url}: {e}",
+        raise HTTPException(status_code=500, detail=f"Failed to fetch content from {raw_url}: {e}")
+
+    chunks = chunk_text_words(content, size=1000, overlap=200)
+    if not chunks:
+        chunks = [content]
+
+    objects = []
+    for i, chunk in enumerate(chunks):
+        emb = embedding_model.encode(chunk).tolist()
+        objects.append(
+            Paper(
+                title=f"{request_body.filename}::chunk_{i:03d}",
+                abstract=chunk,
+                authors="Gist User",
+                url=raw_url,
+                embedding=emb,
+            )
         )
 
-    embedding = embedding_model.encode(content).tolist()
-
-    paper_entry = Paper(
-        title=request_body.filename,
-        abstract=content,
-        authors="Gist User",
-        url=raw_url,
-        embedding=embedding,
-    )
-
     try:
-        db.add(paper_entry)
+        db.bulk_save_objects(objects)
         db.commit()
     except Exception as e:
         db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database ingestion failed: {e}",
-        )
+        raise HTTPException(status_code=500, detail=f"Database ingestion failed: {e}")
 
-    return {"message": f"Successfully ingested file '{request_body.filename}'."}
+    return {"message": f"Ingested {len(objects)} chunks from '{request_body.filename}'."}
 
+# --- Query / Similarity ---
 
-# --- RAG Query Endpoints ---
+class QueryRequest(BaseModel):
+    query: str
+    limit: int = 5
+
 class SimilarGistDocsRequest(BaseModel):
     gist_id: str
     document_title: str
     limit: int = 3
-
 
 class SimilarLLMRequest(BaseModel):
     document_title: str
     limit: int = 3
     llm_type: str = "gemini"
 
+def search_db_for_vectors_sync(db: SessionLocal, query_embedding_list: List[float], limit: int) -> List[Paper]:
+    try:
+        return (
+            db.query(Paper)
+            .order_by(Paper.embedding.cosine_distance(query_embedding_list))
+            .limit(limit)
+            .all()
+        )
+    except Exception as e:
+        logger.error(f"Vector search error: {e}")
+        return []
+
+def search_db_for_vectors_filtered_sync(db: SessionLocal, query_embedding_list: List[float], limit: int, exclude_title: str) -> List[Paper]:
+    try:
+        return (
+            db.query(Paper)
+            .filter(Paper.title != exclude_title)
+            .order_by(Paper.embedding.cosine_distance(query_embedding_list))
+            .limit(limit)
+            .all()
+        )
+    except Exception as e:
+        logger.error(f"Filtered vector search error: {e}")
+        return []
+
+def search_db_by_keywords_sync(db: SessionLocal, query_text: str, limit: int) -> List[Paper]:
+    """
+    Simple keyword fallback using ILIKE on title/abstract.
+    """
+    tokens = tokenize_query_for_keywords(query_text)
+    if not tokens:
+        return []
+    ilike_terms = [Paper.title.ilike(f"%{t}%") for t in tokens] + [Paper.abstract.ilike(f"%{t}%") for t in tokens]
+    try:
+        return (
+            db.query(Paper)
+            .filter(or_(*ilike_terms))
+            .limit(limit)
+            .all()
+        )
+    except Exception as e:
+        logger.error(f"Keyword search error: {e}")
+        return []
 
 @app.post("/query")
 async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_db)):
     """
-    RAG query with:
-      - cosine similarity retrieval (pgvector)
-      - wider recall pool (~4x limit), then trim
-      - strict prompt allowing safe inverse family relations
-      - deterministic generation (temperature=0) for both LLMs
-      - returns llm_used for debugging
+    Hybrid RAG:
+      - Embed query (cosine distance)
+      - Pull a wider vector pool (~4x limit)
+      - Pull keyword matches
+      - Merge & dedupe, then trim to final limit
+      - Strict prompt permits inverse family relations
+      - Deterministic LLM (temperature=0)
     """
     global embedding_model, gemini_model, openai_client
 
     if embedding_model is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Embedding model not loaded.",
-        )
+        raise HTTPException(status_code=500, detail="Embedding model not loaded.")
     if gemini_model is None and openai_client is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="No LLM API configured.",
-        )
-
+        raise HTTPException(status_code=500, detail="No LLM API configured.")
     if not request_body.query:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Query parameter is required in the body.",
-        )
+        raise HTTPException(status_code=400, detail="Query parameter is required in the body.")
 
-    logger.info(f"Received query: '{request_body.query}'")
+    logger.info(f"Query: {request_body.query}")
+    loop = asyncio.get_event_loop()
 
-    # 1) Embed query
-    query_embedding = embedding_model.encode([request_body.query])[0].tolist()
-    logger.info(f"Query embedding generated. Length: {len(query_embedding)}")
-
-    # 2) Fetch a larger pool for better recall, then trim to the requested limit
+    # 1) Embed and vector-retrieve a larger pool
+    q_emb = embedding_model.encode([request_body.query])[0].tolist()
     pool_k = max(request_body.limit, 5) * 4  # e.g., 5 -> 20
-    relevant_pool = await asyncio.get_event_loop().run_in_executor(
-        executor, search_db_for_vectors_sync, db, query_embedding, pool_k
-    )
-    logger.info(f"Fetched {len(relevant_pool)} candidates from vector search (pool).")
+    vec_pool = await loop.run_in_executor(executor, search_db_for_vectors_sync, db, q_emb, pool_k)
 
-    if not relevant_pool:
-        return {
-            "response": "I could not find any relevant documents in the knowledge base to answer your question."
-        }
+    # 2) Keyword fallback pool
+    kw_pool = await loop.run_in_executor(executor, search_db_by_keywords_sync, db, request_body.query, pool_k)
 
-    # Trim to the final limit (already distance-ordered in DB)
-    relevant_papers = relevant_pool[: request_body.limit]
-    logger.info(f"Using top {len(relevant_papers)} documents for LLM context.")
+    # 3) Combine (vector order first), dedupe by id
+    combined = []
+    seen = set()
+    for p in vec_pool + kw_pool:
+        if p.id not in seen:
+            combined.append(p)
+            seen.add(p.id)
 
-    # 3) Build document context
-    documents_text = "\n\n".join(
-        [
-            f"Title: {p.title}\nAuthors: {p.authors}\nAbstract: {p.abstract}"
-            for p in relevant_papers
-        ]
-    )
+    if not combined:
+        return {"response": "I could not find any relevant documents in the knowledge base to answer your question."}
 
-    # 4) Stricter prompt: allow safe inverse of relationships, otherwise say "I don't know"
+    # 4) Trim to final limit for LLM context
+    relevant = combined[:request_body.limit]
+    documents_text = "\n\n".join([f"Title: {p.title}\nAuthors: {p.authors}\nAbstract: {p.abstract}" for p in relevant])
+
+    # 5) Strict prompt allowing inverse family relations
     augmented_prompt = (
         "You are a factual QA assistant.\n"
         "RULES:\n"
@@ -452,27 +455,16 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
         f"{request_body.query}\n"
     )
 
-    logger.info("Sending augmented prompt to LLM...")
+    logger.info("Sending to LLM...")
     try:
-        llm_response = None
         llm_used = None
+        llm_response = None
 
-        if gemini_model:
-            gen_config = {
-                "temperature": 0.0,
-                "top_p": 0.1,
-                "top_k": 1,
-                "max_output_tokens": 512,
-            }
-            gemini_response = gemini_model.generate_content(
-                augmented_prompt, generation_config=gen_config
-            )
-            llm_response = gemini_response.text
-            llm_used = "gemini-2.0-flash"
-        elif openai_client:
+        provider = LLM_PROVIDER or ("gemini" if gemini_model else ("openai" if openai_client else ""))
+        if provider == "openai" and openai_client:
             completion = openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",
-                temperature=0.0,  # deterministic
+                temperature=0.0,
                 messages=[
                     {"role": "system", "content": "Follow the user's RULES exactly."},
                     {"role": "user", "content": augmented_prompt},
@@ -480,111 +472,90 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
             )
             llm_response = completion.choices[0].message.content
             llm_used = "openai:gpt-3.5-turbo"
+        elif provider == "gemini" and gemini_model:
+            gen_cfg = {"temperature": 0.0, "top_p": 0.1, "top_k": 1, "max_output_tokens": 512}
+            g = gemini_model.generate_content(augmented_prompt, generation_config=gen_cfg)
+            llm_response = g.text
+            llm_used = "gemini-2.0-flash"
+        else:
+            # fallback to whichever is available
+            if gemini_model:
+                gen_cfg = {"temperature": 0.0, "top_p": 0.1, "top_k": 1, "max_output_tokens": 512}
+                g = gemini_model.generate_content(augmented_prompt, generation_config=gen_cfg)
+                llm_response = g.text
+                llm_used = "gemini-2.0-flash"
+            elif openai_client:
+                completion = openai_client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    temperature=0.0,
+                    messages=[
+                        {"role": "system", "content": "Follow the user's RULES exactly."},
+                        {"role": "user", "content": augmented_prompt},
+                    ],
+                )
+                llm_response = completion.choices[0].message.content
+                llm_used = "openai:gpt-3.5-turbo"
 
-        logger.info("LLM response received.")
         return {
             "response": llm_response,
             "llm_used": llm_used,
             "relevant_documents": [
-                {
-                    "title": p.title,
-                    "authors": p.authors,
-                    "url": p.url,
-                    "abstract": p.abstract,
-                }
-                for p in relevant_papers
+                {"title": p.title, "authors": p.authors, "url": p.url, "abstract": p.abstract} for p in relevant
             ],
         }
     except Exception as e:
-        logger.error(f"Error during LLM generation: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"LLM generation failed: {e}",
-        )
-
+        logger.error(f"LLM generation error: {e}")
+        raise HTTPException(status_code=500, detail=f"LLM generation failed: {e}")
 
 @app.post("/find-similar-gist-docs")
-async def find_similar_gist_docs(
-    request_body: SimilarGistDocsRequest, db: SessionLocal = Depends(get_db)
-):
+async def find_similar_gist_docs(request_body: SimilarGistDocsRequest, db: SessionLocal = Depends(get_db)):
     """
-    Finds documents within a specific Gist that are semantically similar to a given document title.
+    Finds documents similar to a given document title (now chunk-friendly).
+    If you pass a base filename ('file.txt'), it will match chunked titles like 'file.txt::chunk_000'.
     """
     global embedding_model
     if embedding_model is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Embedding model not loaded.",
-        )
+        raise HTTPException(status_code=500, detail="Embedding model not loaded.")
 
-    # 1. Find the embedding of the document_title within the specified Gist
+    # More flexible match against chunked titles
     target_paper = (
         db.query(Paper)
-        .filter(
-            Paper.title == request_body.document_title,
-            Paper.url.like(
-                f"https://gist.githubusercontent.com/%/%/raw/{request_body.document_title}"
-            ),
-        )
+        .filter(Paper.title.ilike(f"{request_body.document_title}%"))
         .first()
     )
 
     if not target_paper:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Document with title '{request_body.document_title}' not found in the specified Gist.",
-        )
+        raise HTTPException(status_code=404, detail=f"Document with title starting '{request_body.document_title}' not found.")
 
     target_embedding = target_paper.embedding
 
-    # 2. Search for similar documents, excluding the target itself
     relevant_papers = await asyncio.get_event_loop().run_in_executor(
-        executor,
-        search_db_for_vectors_filtered_sync,
-        db,
-        target_embedding,
-        request_body.limit + 1,
-        request_body.document_title,
+        executor, search_db_for_vectors_filtered_sync, db, target_embedding, request_body.limit + 1, target_paper.title
     )
 
-    # Filter out the target paper from the results
-    filtered_results = [p for p in relevant_papers if p.title != request_body.document_title]
-
+    filtered_results = [p for p in relevant_papers if p.title != target_paper.title]
     if not filtered_results:
-        return {
-            "message": f"No similar documents found in the Gist for '{request_body.document_title}'."
-        }
+        return {"message": f"No similar documents found for '{request_body.document_title}'."}
 
     return {
         "similar_documents": [
-            {"title": p.title, "authors": p.authors, "url": p.url, "abstract": p.abstract}
-            for p in filtered_results
+            {"title": p.title, "authors": p.authors, "url": p.url, "abstract": p.abstract} for p in filtered_results
         ]
     }
 
-
 @app.post("/find-similar-llm")
-async def find_similar_llm(
-    request_body: SimilarLLMRequest, db: SessionLocal = Depends(get_db)
-):
+async def find_similar_llm(request_body: SimilarLLMRequest, db: SessionLocal = Depends(get_db)):
     """
     Uses an LLM to generate a search query from a document title and then finds similar articles.
     """
     global embedding_model, gemini_model, openai_client
 
     if embedding_model is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Embedding model not loaded.",
-        )
+        raise HTTPException(status_code=500, detail="Embedding model not loaded.")
     if gemini_model is None and openai_client is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="No LLM API configured.",
-        )
+        raise HTTPException(status_code=500, detail="No LLM API configured.")
 
-    # 1. Use LLM to generate a semantic query from the document title
-    llm_query_prompt = (
+    prompt = (
         f"Generate a semantic search query for academic papers about the topic of: '{request_body.document_title}'. "
         "The query should be a single, concise sentence."
     )
@@ -592,91 +563,37 @@ async def find_similar_llm(
     try:
         llm_response = None
         if request_body.llm_type == "gemini" and gemini_model:
-            gen_config = {
-                "temperature": 0.0,
-                "top_p": 0.1,
-                "top_k": 1,
-                "max_output_tokens": 128,
-            }
-            gemini_response = gemini_model.generate_content(
-                llm_query_prompt, generation_config=gen_config
-            )
-            llm_response = gemini_response.text
+            gen_cfg = {"temperature": 0.0, "top_p": 0.1, "top_k": 1, "max_output_tokens": 128}
+            g = gemini_model.generate_content(prompt, generation_config=gen_cfg)
+            llm_response = g.text
         elif request_body.llm_type == "openai" and openai_client:
-            completion = openai_client.chat.completions.create(
+            c = openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 temperature=0.0,
-                messages=[{"role": "user", "content": llm_query_prompt}],
+                messages=[{"role": "user", "content": prompt}],
             )
-            llm_response = completion.choices[0].message.content
+            llm_response = c.choices[0].message.content
         else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid LLM type '{request_body.llm_type}' or API not configured.",
-            )
+            raise HTTPException(status_code=400, detail=f"Invalid LLM type '{request_body.llm_type}' or API not configured.")
 
         if not llm_response:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="LLM failed to generate a query.",
-            )
+            raise HTTPException(status_code=500, detail="LLM failed to generate a query.")
 
         generated_query = llm_response.strip().strip('"')
-
     except Exception as e:
-        logger.error(f"Error generating LLM query: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"LLM query generation failed: {e}",
-        )
+        logger.error(f"LLM query generation error: {e}")
+        raise HTTPException(status_code=500, detail=f"LLM query generation failed: {e}")
 
-    # 2. Use the generated query to perform a semantic search
-    query_embedding = embedding_model.encode([generated_query])[0].tolist()
-    relevant_papers = await asyncio.get_event_loop().run_in_executor(
-        executor, search_db_for_vectors_sync, db, query_embedding, request_body.limit
+    q_emb = embedding_model.encode([generated_query])[0].tolist()
+    relevant = await asyncio.get_event_loop().run_in_executor(
+        executor, search_db_for_vectors_sync, db, q_emb, request_body.limit
     )
 
-    if not relevant_papers:
+    if not relevant:
         return {"message": "No similar documents found based on the LLM-generated query."}
 
     return {
         "similar_documents": [
-            {"title": p.title, "authors": p.authors, "url": p.url, "abstract": p.abstract}
-            for p in relevant_papers
+            {"title": p.title, "authors": p.authors, "url": p.url, "abstract": p.abstract} for p in relevant
         ]
     }
-
-
-# --- Vector Search Helpers (COSINE distance) ---
-
-def search_db_for_vectors_filtered_sync(
-    db: SessionLocal, query_embedding_list: List[float], limit: int, exclude_title: str
-) -> List[Paper]:
-    try:
-        results = (
-            db.query(Paper)
-            .filter(Paper.title != exclude_title)
-            .order_by(Paper.embedding.cosine_distance(query_embedding_list))
-            .limit(limit)
-            .all()
-        )
-        return results
-    except Exception as e:
-        logger.error(f"Error searching filtered database for vectors: {e}")
-        return []
-
-
-def search_db_for_vectors_sync(
-    db: SessionLocal, query_embedding_list: List[float], limit: int
-) -> List[Paper]:
-    try:
-        results = (
-            db.query(Paper)
-            .order_by(Paper.embedding.cosine_distance(query_embedding_list))
-            .limit(limit)
-            .all()
-        )
-        return results
-    except Exception as e:
-        logger.error(f"Error searching database for vectors: {e}")
-        return []
