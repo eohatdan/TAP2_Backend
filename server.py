@@ -8,7 +8,7 @@ import logging
 from typing import List, Dict, Tuple, Set
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
-from collections import defaultdict, deque
+from collections import defaultdict
 
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,17 +24,17 @@ from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 import openai
 
-# -------- Logging --------
+# ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# -------- Globals --------
+# ---------------- Globals ----------------
 embedding_model = None
 gemini_model = None
 openai_client = None
 executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 1)
 
-# -------- Env / Config --------
+# ---------------- Env / Config ----------------
 DATABASE_URL = os.environ.get("DATABASE_URL")
 print("Database URL:", DATABASE_URL)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -44,7 +44,7 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "").strip().lower()  # optional: 'opena
 if not DATABASE_URL:
     logger.error("DATABASE_URL environment variable not set.")
 
-# -------- DB setup --------
+# ---------------- DB setup ----------------
 Base = declarative_base()
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -56,25 +56,28 @@ class Paper(Base):
     abstract = Column(String)
     authors = Column(String)
     url = Column(String)
-    embedding = Column(Vector(384))  # keep 384d
+    embedding = Column(Vector(384))  # keep 384 dims (MiniLM/bge-small/e5-small families)
 
-# -------- FastAPI --------
+# ---------------- FastAPI ----------------
 app = FastAPI(
     title="The Aboutness Project Backend API",
     description="API for semantic search and RAG for academic papers.",
-    version="0.4.0",
+    version="0.4.1",
 )
 
+# CORS: allow your GitHub Pages domain (any path under it)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://eohatdan.github.io"],
+    allow_origins=[],  # use regex instead for flexibility
+    allow_origin_regex=r"^https://eohatdan\.github\.io($|/.*)",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -------- Utils: chunking, tokenizing --------
+# ---------------- Utilities ----------------
 def chunk_text_words(text: str, size: int = 1000, overlap: int = 200) -> List[str]:
+    """Word-based chunking with overlap to keep relationships local."""
     words = text.split()
     if not words:
         return []
@@ -90,9 +93,12 @@ def tokenize_query_for_keywords(q: str) -> List[str]:
     toks = re.findall(r"[A-Za-z0-9']+", q.lower())
     return [t for t in toks if len(t) >= 3]
 
-# -------- Relation Extraction (regex) --------
-# Supported relations: father, mother, parent, son, daughter, child, husband, wife, spouse
-NAME = r"[A-Z][a-z]+(?: [A-Z][a-z]+){0,3}"  # Up to 4 tokens
+def normalize_name(s: str) -> str:
+    return re.sub(r"\s+", " ", s.strip())
+
+# ---------------- Relation Extraction ----------------
+# Supported: father, mother, parent, son, daughter, child, husband, wife, spouse (+ grandparents via reasoning)
+NAME = r"[A-Z][a-z]+(?: [A-Z][a-z]+){0,3}"  # up to 4 tokens
 OF = r"\s+of\s+"
 IS_THE = r"\s+is\s+the\s+"
 WAS_THE = r"\s+was\s+the\s+"
@@ -100,18 +106,10 @@ IS = r"\s+is\s+"
 WAS = r"\s+was\s+"
 
 REL_PATTERNS = [
-    # A is the father of B / A was the father of B
     (re.compile(fr"({NAME})(?:{IS_THE}|{WAS_THE})(father|mother|son|daughter|husband|wife|spouse|parent|child){OF}({NAME})", re.IGNORECASE), "dir"),
-    # A is B's father / A was B's father
-    (re.compile(fr"({NAME})(?:{IS}|{WAS})(?:{NAME})'?s\s+(father|mother|son|daughter|husband|wife|spouse|parent|child)", re.IGNORECASE), "poss"),
-    # B's father is A
-    (re.compile(fr"({NAME})'?s\s+(father|mother|son|daughter|husband|wife|spouse|parent|child){IS}({NAME})", re.IGNORECASE), "inv"),
+    (re.compile(fr"({NAME})(?:{IS}|{WAS})({NAME})'?s\s+(father|mother|son|daughter|husband|wife|spouse|parent|child)", re.IGNORECASE), "poss"),  # A is B's father
+    (re.compile(fr"({NAME})'?s\s+(father|mother|son|daughter|husband|wife|spouse|parent|child){IS}({NAME})", re.IGNORECASE), "inv"),  # B's father is A
 ]
-
-# Canonical relation directions we store in the graph:
-# parent_of(A,B), child_of(A,B), spouse_of(A,B) (undirected)
-def normalize_name(s: str) -> str:
-    return re.sub(r"\s+", " ", s.strip())
 
 def rel_to_edges(subj: str, rel: str, obj: str) -> List[Tuple[str, str, str]]:
     s = normalize_name(subj)
@@ -125,7 +123,6 @@ def rel_to_edges(subj: str, rel: str, obj: str) -> List[Tuple[str, str, str]]:
         edges.append(("child_of", s, o))
         edges.append(("parent_of", o, s))
     elif r in ["husband", "wife", "spouse"]:
-        # store as undirected: add both ways
         edges.append(("spouse_of", s, o))
         edges.append(("spouse_of", o, s))
     return edges
@@ -138,24 +135,20 @@ def extract_relations(text: str) -> List[Tuple[str, str, str]]:
                 a, r, b = m.group(1), m.group(2), m.group(3)
                 triples.extend(rel_to_edges(a, r, b))
             elif kind == "poss":
-                # "A is B's father" -> subject=A, rel=father, object=B
-                a, b, r = m.group(1), m.group(2), m.group(3)
-                # careful: groups swapped; pattern: (A) is (B)'s (rel)
-                # Our regex was (A)(is/was)(B)'s (rel) — groups(1)=A, (2)=B, (3)=rel
+                a, b, r = m.group(1), m.group(2), m.group(3)  # A is B's r
                 triples.extend(rel_to_edges(a, r, b))
             elif kind == "inv":
-                # "B's father is A" -> subject=B, rel=father, object=A
-                b, r, a = m.group(1), m.group(2), m.group(3)
-                triples.extend(rel_to_edges(a, r, b))  # A is parent_of B, etc.
+                b, r, a = m.group(1), m.group(2), m.group(3)  # B's r is A
+                triples.extend(rel_to_edges(a, r, b))
     return triples
 
-# Build a tiny graph and reason simple queries (parent/child/spouse and grandparents)
+# ---------------- Mini Graph ----------------
 class MiniGraph:
     def __init__(self):
         self.parents: Dict[str, Set[str]] = defaultdict(set)   # parents[child] -> {parent1, parent2}
         self.children: Dict[str, Set[str]] = defaultdict(set)  # children[parent] -> {child1, child2}
         self.spouses: Dict[str, Set[str]]  = defaultdict(set)  # spouses[a] -> {b,...}
-        self.edge_sources: Dict[Tuple[str,str,str], Set[str]] = defaultdict(set)  # (rel, a, b) -> {source_titles}
+        self.edge_sources: Dict[Tuple[str,str,str], Set[str]] = defaultdict(set)  # (rel,a,b)->{source_titles}
 
     def add(self, rel: str, a: str, b: str, source_title: str):
         if rel == "parent_of":
@@ -187,26 +180,15 @@ class MiniGraph:
     def sources_for(self, rel: str, a: str, b: str) -> Set[str]:
         return self.edge_sources.get((rel, a, b), set())
 
-# Parse natural questions into (target_person, relation)
 REL_ALIASES = {
-    "father": "father",
-    "mother": "mother",
-    "parent": "parent",
-    "son": "son",
-    "daughter": "daughter",
-    "child": "child",
-    "husband": "spouse",
-    "wife": "spouse",
-    "spouse": "spouse",
-    "grandfather": "grandfather",
-    "grandmother": "grandmother",
-    "grandparent": "grandparent",
+    "father": "father", "mother": "mother", "parent": "parent",
+    "son": "son", "daughter": "daughter", "child": "child",
+    "husband": "spouse", "wife": "spouse", "spouse": "spouse",
+    "grandfather": "grandparent", "grandmother": "grandparent", "grandparent": "grandparent",
 }
 
 Q_PATTERNS = [
-    # who is A's <rel> ?
     re.compile(r"who\s+is\s+(.+?)'s\s+([a-z]+)\??", re.IGNORECASE),
-    # who is the <rel> of A ?
     re.compile(r"who\s+is\s+the\s+([a-z]+)\s+of\s+(.+?)\??", re.IGNORECASE),
 ]
 
@@ -215,7 +197,7 @@ def parse_question(q: str) -> Tuple[str, str]:
     for pat in Q_PATTERNS:
         m = pat.search(q)
         if m:
-            if pat.pattern.startswith("who\\s+is\\s+(.+?)'s"):
+            if pat is Q_PATTERNS[0]:
                 person, rel = m.group(1), m.group(2).lower()
             else:
                 rel, person = m.group(1).lower(), m.group(2)
@@ -224,10 +206,6 @@ def parse_question(q: str) -> Tuple[str, str]:
     return ("", "")
 
 def answer_from_graph(G: MiniGraph, person: str, rel: str) -> Tuple[List[str], List[str]]:
-    """
-    Returns (answers, sources_list). answers is list of names.
-    sources_list is a list of source titles used (deduped).
-    """
     answers: Set[str] = set()
     sources: Set[str] = set()
 
@@ -236,19 +214,9 @@ def answer_from_graph(G: MiniGraph, person: str, rel: str) -> Tuple[List[str], L
 
     if rel in ["father", "mother", "parent"]:
         parents = G.get_parents(person)
-        if rel == "father":
-            # we don't track gender; return all parents, LLM or downstream UI can display both
-            for p in parents:
-                answers.add(p)
-                sources.update(G.sources_for("parent_of", p, person))
-        elif rel == "mother":
-            for p in parents:
-                answers.add(p)
-                sources.update(G.sources_for("parent_of", p, person))
-        else:  # parent
-            for p in parents:
-                answers.add(p)
-                sources.update(G.sources_for("parent_of", p, person))
+        for p in parents:
+            answers.add(p)
+            sources.update(G.sources_for("parent_of", p, person))
 
     elif rel in ["son", "daughter", "child"]:
         children = G.get_children(person)
@@ -260,24 +228,21 @@ def answer_from_graph(G: MiniGraph, person: str, rel: str) -> Tuple[List[str], L
         spouses = G.get_spouses(person)
         for s in spouses:
             answers.add(s)
-            # spouses stored undirected; record any spouse_of edge source
             sources.update(G.sources_for("spouse_of", person, s))
             sources.update(G.sources_for("spouse_of", s, person))
 
-    elif rel in ["grandfather", "grandmother", "grandparent"]:
+    elif rel == "grandparent":
         gps = G.get_grandparents(person)
         for gp in gps:
             answers.add(gp)
-            # collect sources via parent links (two hops)
             for p in G.get_parents(person):
                 sources.update(G.sources_for("parent_of", p, person))
-                for gpp in G.get_parents(p):
-                    if gpp == gp:
-                        sources.update(G.sources_for("parent_of", gp, p))
+                if gp in G.get_parents(p):
+                    sources.update(G.sources_for("parent_of", gp, p))
 
     return (sorted(answers), sorted(set(sources)))
 
-# -------- Dependencies --------
+# ---------------- Dependencies ----------------
 def get_db():
     db = SessionLocal()
     try:
@@ -285,7 +250,7 @@ def get_db():
     finally:
         db.close()
 
-# -------- Startup --------
+# ---------------- Startup ----------------
 @app.on_event("startup")
 async def startup_event():
     logger.info("Backend starting...")
@@ -333,7 +298,7 @@ async def startup_event():
     Base.metadata.create_all(bind=engine)
     logger.info("Schema ensured.")
 
-# -------- Basic endpoints --------
+# ---------------- Basic endpoints ----------------
 @app.get("/")
 async def read_root():
     return {"message": "Welcome to The Aboutness Project Backend API!"}
@@ -351,7 +316,7 @@ async def which_llm():
     preferred = LLM_PROVIDER or ("gemini" if gemini_model else ("openai" if openai_client else "none"))
     return {"gemini_active": gemini_model is not None, "openai_active": openai_client is not None, "preferred": preferred}
 
-# -------- Ingestion --------
+# ---------------- Ingestion ----------------
 class IngestGistFileRequest(BaseModel):
     gist_id: str
     filename: str
@@ -418,6 +383,7 @@ async def bulk_load_gist(gist_id: str, db: SessionLocal = Depends(get_db)):
 async def ingest_gist_file(request_body: IngestGistFileRequest, db: SessionLocal = Depends(get_db)):
     if embedding_model is None:
         raise HTTPException(status_code=500, detail="Embedding model not loaded.")
+
     api_url = f"https://api.github.com/gists/{request_body.gist_id}"
     try:
         response = requests.get(api_url)
@@ -460,7 +426,7 @@ async def ingest_gist_file(request_body: IngestGistFileRequest, db: SessionLocal
 
     return {"message": f"Ingested {len(objs)} chunks from '{request_body.filename}'."}
 
-# -------- Querying --------
+# ---------------- Querying ----------------
 class QueryRequest(BaseModel):
     query: str
     limit: int = 5
@@ -532,7 +498,7 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
 
     loop = asyncio.get_event_loop()
     q_emb = embedding_model.encode([request_body.query])[0].tolist()
-    pool_k = max(request_body.limit, 5) * 4
+    pool_k = max(request_body.limit, 5) * 4  # e.g., 5 -> 20
 
     vec_pool = await loop.run_in_executor(executor, search_db_for_vectors_sync, db, q_emb, pool_k)
     kw_pool  = await loop.run_in_executor(executor, search_db_by_keywords_sync, db, request_body.query, pool_k)
@@ -550,23 +516,20 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
     relevant = combined[:request_body.limit]
     documents_text = "\n\n".join([f"Title: {p.title}\nAuthors: {p.authors}\nAbstract: {p.abstract}" for p in relevant])
 
-    # ---------- NEW: Graph reasoning pass ----------
+    # Graph reasoning for kinship questions
     person, rel = parse_question(request_body.query)
-    graph_answers, graph_sources = ([], [])
     if person and rel:
         G = build_graph_from_chunks(relevant)
         graph_answers, graph_sources = answer_from_graph(G, person, rel)
+        if graph_answers:
+            return {
+                "response": ", ".join(graph_answers),
+                "llm_used": "graph",
+                "sources": graph_sources,
+                "relevant_documents": [{"title": p.title, "authors": p.authors, "url": p.url} for p in relevant],
+            }
 
-    if graph_answers:
-        # Deterministic graph-derived answer with sources (no LLM)
-        return {
-            "response": ", ".join(graph_answers),
-            "llm_used": "graph",
-            "sources": graph_sources,
-            "relevant_documents": [{"title": p.title, "authors": p.authors, "url": p.url} for p in relevant],
-        }
-
-    # ---------- Fall back to LLM with stricter prompt ----------
+    # Fall back to LLM with strict prompt
     augmented_prompt = (
         "You are a factual QA assistant.\n"
         "RULES:\n"
@@ -605,6 +568,7 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
             llm_response = g.text
             llm_used = "gemini-2.0-flash"
         else:
+            # fallback to whichever is available
             if gemini_model:
                 gen_cfg = {"temperature": 0.0, "top_p": 0.1, "top_k": 1, "max_output_tokens": 512}
                 g = gemini_model.generate_content(augmented_prompt, generation_config=gen_cfg)
@@ -631,12 +595,13 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
         logger.error(f"LLM generation error: {e}")
         raise HTTPException(status_code=500, detail=f"LLM generation failed: {e}")
 
-# -------- Similarity helpers --------
+# ---------------- Similarity helpers ----------------
 @app.post("/find-similar-gist-docs")
 async def find_similar_gist_docs(request_body: SimilarGistDocsRequest, db: SessionLocal = Depends(get_db)):
     if embedding_model is None:
         raise HTTPException(status_code=500, detail="Embedding model not loaded.")
 
+    # chunk-friendly: passing "file.txt" matches "file.txt::chunk_000"
     target_paper = (
         db.query(Paper)
         .filter(Paper.title.ilike(f"{request_body.document_title}%"))
