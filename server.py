@@ -5,9 +5,10 @@ import re
 import requests
 import uuid
 import logging
-from typing import List
+from typing import List, Dict, Tuple, Set
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
+from collections import defaultdict, deque
 
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,27 +18,23 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.exc import OperationalError
 
-# Vector embeddings
 from pgvector.sqlalchemy import Vector
 
-# RAG deps
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 import openai
 
-# --- Logging ---
+# -------- Logging --------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Globals ---
+# -------- Globals --------
 embedding_model = None
 gemini_model = None
 openai_client = None
-
-# Thread pool for blocking DB operations
 executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 1)
 
-# --- Config / Env ---
+# -------- Env / Config --------
 DATABASE_URL = os.environ.get("DATABASE_URL")
 print("Database URL:", DATABASE_URL)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -47,31 +44,27 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "").strip().lower()  # optional: 'opena
 if not DATABASE_URL:
     logger.error("DATABASE_URL environment variable not set.")
 
-# --- SQLAlchemy ---
+# -------- DB setup --------
 Base = declarative_base()
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# --- Model ---
 class Paper(Base):
     __tablename__ = "papers"
-
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     title = Column(String)
     abstract = Column(String)
     authors = Column(String)
     url = Column(String)
-    # Keep 384 dims to match MiniLM/bge-small/e5-small families (no schema change)
-    embedding = Column(Vector(384))
+    embedding = Column(Vector(384))  # keep 384d
 
-# --- FastAPI app ---
+# -------- FastAPI --------
 app = FastAPI(
     title="The Aboutness Project Backend API",
     description="API for semantic search and RAG for academic papers.",
-    version="0.3.0",
+    version="0.4.0",
 )
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://eohatdan.github.io"],
@@ -80,32 +73,211 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Utils ---
-
+# -------- Utils: chunking, tokenizing --------
 def chunk_text_words(text: str, size: int = 1000, overlap: int = 200) -> List[str]:
-    """
-    Simple word-based chunking with overlap to keep relationships local.
-    """
     words = text.split()
     if not words:
         return []
-    chunks = []
+    out = []
     i = 0
     step = max(1, size - overlap)
     while i < len(words):
-        chunk = " ".join(words[i:i+size])
-        chunks.append(chunk)
+        out.append(" ".join(words[i:i+size]))
         i += step
-    return chunks
+    return out
 
 def tokenize_query_for_keywords(q: str) -> List[str]:
-    """
-    Extract simple keywords (alnum + apostrophes) and drop very short tokens.
-    """
     toks = re.findall(r"[A-Za-z0-9']+", q.lower())
     return [t for t in toks if len(t) >= 3]
 
-# --- Dependencies ---
+# -------- Relation Extraction (regex) --------
+# Supported relations: father, mother, parent, son, daughter, child, husband, wife, spouse
+NAME = r"[A-Z][a-z]+(?: [A-Z][a-z]+){0,3}"  # Up to 4 tokens
+OF = r"\s+of\s+"
+IS_THE = r"\s+is\s+the\s+"
+WAS_THE = r"\s+was\s+the\s+"
+IS = r"\s+is\s+"
+WAS = r"\s+was\s+"
+
+REL_PATTERNS = [
+    # A is the father of B / A was the father of B
+    (re.compile(fr"({NAME})(?:{IS_THE}|{WAS_THE})(father|mother|son|daughter|husband|wife|spouse|parent|child){OF}({NAME})", re.IGNORECASE), "dir"),
+    # A is B's father / A was B's father
+    (re.compile(fr"({NAME})(?:{IS}|{WAS})(?:{NAME})'?s\s+(father|mother|son|daughter|husband|wife|spouse|parent|child)", re.IGNORECASE), "poss"),
+    # B's father is A
+    (re.compile(fr"({NAME})'?s\s+(father|mother|son|daughter|husband|wife|spouse|parent|child){IS}({NAME})", re.IGNORECASE), "inv"),
+]
+
+# Canonical relation directions we store in the graph:
+# parent_of(A,B), child_of(A,B), spouse_of(A,B) (undirected)
+def normalize_name(s: str) -> str:
+    return re.sub(r"\s+", " ", s.strip())
+
+def rel_to_edges(subj: str, rel: str, obj: str) -> List[Tuple[str, str, str]]:
+    s = normalize_name(subj)
+    o = normalize_name(obj)
+    r = rel.lower()
+    edges = []
+    if r in ["father", "mother", "parent"]:
+        edges.append(("parent_of", s, o))
+        edges.append(("child_of", o, s))
+    elif r in ["son", "daughter", "child"]:
+        edges.append(("child_of", s, o))
+        edges.append(("parent_of", o, s))
+    elif r in ["husband", "wife", "spouse"]:
+        # store as undirected: add both ways
+        edges.append(("spouse_of", s, o))
+        edges.append(("spouse_of", o, s))
+    return edges
+
+def extract_relations(text: str) -> List[Tuple[str, str, str]]:
+    triples = []
+    for pat, kind in REL_PATTERNS:
+        for m in pat.finditer(text):
+            if kind == "dir":
+                a, r, b = m.group(1), m.group(2), m.group(3)
+                triples.extend(rel_to_edges(a, r, b))
+            elif kind == "poss":
+                # "A is B's father" -> subject=A, rel=father, object=B
+                a, b, r = m.group(1), m.group(2), m.group(3)
+                # careful: groups swapped; pattern: (A) is (B)'s (rel)
+                # Our regex was (A)(is/was)(B)'s (rel) — groups(1)=A, (2)=B, (3)=rel
+                triples.extend(rel_to_edges(a, r, b))
+            elif kind == "inv":
+                # "B's father is A" -> subject=B, rel=father, object=A
+                b, r, a = m.group(1), m.group(2), m.group(3)
+                triples.extend(rel_to_edges(a, r, b))  # A is parent_of B, etc.
+    return triples
+
+# Build a tiny graph and reason simple queries (parent/child/spouse and grandparents)
+class MiniGraph:
+    def __init__(self):
+        self.parents: Dict[str, Set[str]] = defaultdict(set)   # parents[child] -> {parent1, parent2}
+        self.children: Dict[str, Set[str]] = defaultdict(set)  # children[parent] -> {child1, child2}
+        self.spouses: Dict[str, Set[str]]  = defaultdict(set)  # spouses[a] -> {b,...}
+        self.edge_sources: Dict[Tuple[str,str,str], Set[str]] = defaultdict(set)  # (rel, a, b) -> {source_titles}
+
+    def add(self, rel: str, a: str, b: str, source_title: str):
+        if rel == "parent_of":
+            self.parents[b].add(a)
+            self.children[a].add(b)
+        elif rel == "child_of":
+            self.children[b].add(a)
+            self.parents[a].add(b)
+        elif rel == "spouse_of":
+            self.spouses[a].add(b)
+            self.spouses[b].add(a)
+        self.edge_sources[(rel, a, b)].add(source_title)
+
+    def get_parents(self, person: str) -> Set[str]:
+        return self.parents.get(person, set())
+
+    def get_children(self, person: str) -> Set[str]:
+        return self.children.get(person, set())
+
+    def get_spouses(self, person: str) -> Set[str]:
+        return self.spouses.get(person, set())
+
+    def get_grandparents(self, person: str) -> Set[str]:
+        gps = set()
+        for p in self.get_parents(person):
+            gps.update(self.get_parents(p))
+        return gps
+
+    def sources_for(self, rel: str, a: str, b: str) -> Set[str]:
+        return self.edge_sources.get((rel, a, b), set())
+
+# Parse natural questions into (target_person, relation)
+REL_ALIASES = {
+    "father": "father",
+    "mother": "mother",
+    "parent": "parent",
+    "son": "son",
+    "daughter": "daughter",
+    "child": "child",
+    "husband": "spouse",
+    "wife": "spouse",
+    "spouse": "spouse",
+    "grandfather": "grandfather",
+    "grandmother": "grandmother",
+    "grandparent": "grandparent",
+}
+
+Q_PATTERNS = [
+    # who is A's <rel> ?
+    re.compile(r"who\s+is\s+(.+?)'s\s+([a-z]+)\??", re.IGNORECASE),
+    # who is the <rel> of A ?
+    re.compile(r"who\s+is\s+the\s+([a-z]+)\s+of\s+(.+?)\??", re.IGNORECASE),
+]
+
+def parse_question(q: str) -> Tuple[str, str]:
+    q = q.strip()
+    for pat in Q_PATTERNS:
+        m = pat.search(q)
+        if m:
+            if pat.pattern.startswith("who\\s+is\\s+(.+?)'s"):
+                person, rel = m.group(1), m.group(2).lower()
+            else:
+                rel, person = m.group(1).lower(), m.group(2)
+            rel = REL_ALIASES.get(rel, rel)
+            return (normalize_name(person), rel)
+    return ("", "")
+
+def answer_from_graph(G: MiniGraph, person: str, rel: str) -> Tuple[List[str], List[str]]:
+    """
+    Returns (answers, sources_list). answers is list of names.
+    sources_list is a list of source titles used (deduped).
+    """
+    answers: Set[str] = set()
+    sources: Set[str] = set()
+
+    if not person or not rel:
+        return ([], [])
+
+    if rel in ["father", "mother", "parent"]:
+        parents = G.get_parents(person)
+        if rel == "father":
+            # we don't track gender; return all parents, LLM or downstream UI can display both
+            for p in parents:
+                answers.add(p)
+                sources.update(G.sources_for("parent_of", p, person))
+        elif rel == "mother":
+            for p in parents:
+                answers.add(p)
+                sources.update(G.sources_for("parent_of", p, person))
+        else:  # parent
+            for p in parents:
+                answers.add(p)
+                sources.update(G.sources_for("parent_of", p, person))
+
+    elif rel in ["son", "daughter", "child"]:
+        children = G.get_children(person)
+        for c in children:
+            answers.add(c)
+            sources.update(G.sources_for("parent_of", person, c))
+
+    elif rel == "spouse":
+        spouses = G.get_spouses(person)
+        for s in spouses:
+            answers.add(s)
+            # spouses stored undirected; record any spouse_of edge source
+            sources.update(G.sources_for("spouse_of", person, s))
+            sources.update(G.sources_for("spouse_of", s, person))
+
+    elif rel in ["grandfather", "grandmother", "grandparent"]:
+        gps = G.get_grandparents(person)
+        for gp in gps:
+            answers.add(gp)
+            # collect sources via parent links (two hops)
+            for p in G.get_parents(person):
+                sources.update(G.sources_for("parent_of", p, person))
+                for gpp in G.get_parents(p):
+                    if gpp == gp:
+                        sources.update(G.sources_for("parent_of", gp, p))
+
+    return (sorted(answers), sorted(set(sources)))
+
+# -------- Dependencies --------
 def get_db():
     db = SessionLocal()
     try:
@@ -113,7 +285,7 @@ def get_db():
     finally:
         db.close()
 
-# --- Startup ---
+# -------- Startup --------
 @app.on_event("startup")
 async def startup_event():
     logger.info("Backend starting...")
@@ -129,8 +301,7 @@ async def startup_event():
     global embedding_model
     try:
         logger.info("Loading embedding model...")
-        # 384-dim model to match schema; feel free to switch to 'bge-small-en-v1.5'
-        embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+        embedding_model = SentenceTransformer("all-MiniLM-L6-v2")  # 384-dim
         logger.info("Embedding model loaded.")
     except Exception as e:
         logger.error(f"Embedding model load error: {e}")
@@ -162,7 +333,7 @@ async def startup_event():
     Base.metadata.create_all(bind=engine)
     logger.info("Schema ensured.")
 
-# --- Root / Health ---
+# -------- Basic endpoints --------
 @app.get("/")
 async def read_root():
     return {"message": "Welcome to The Aboutness Project Backend API!"}
@@ -177,65 +348,44 @@ async def health_check(db: SessionLocal = Depends(get_db)):
 
 @app.get("/which-llm")
 async def which_llm():
-    # Provider preference (if set) + availability
     preferred = LLM_PROVIDER or ("gemini" if gemini_model else ("openai" if openai_client else "none"))
-    return {
-        "gemini_active": gemini_model is not None,
-        "openai_active": openai_client is not None,
-        "preferred": preferred,
-    }
+    return {"gemini_active": gemini_model is not None, "openai_active": openai_client is not None, "preferred": preferred}
 
-# --- Ingestion ---
-
+# -------- Ingestion --------
 class IngestGistFileRequest(BaseModel):
     gist_id: str
     filename: str
 
 @app.post("/bulk-load-gist", status_code=status.HTTP_201_CREATED)
 async def bulk_load_gist(gist_id: str, db: SessionLocal = Depends(get_db)):
-    """
-    Drops all existing data, fetches content from a multi-file Gist,
-    CHUNKS each file, and ingests each chunk as a separate row.
-    """
-    global embedding_model
     if embedding_model is None:
         raise HTTPException(status_code=500, detail="Embedding model not loaded.")
-
-    # Reset table
-    logger.info("Dropping and recreating 'papers' for bulk load...")
+    logger.info("Resetting 'papers' for bulk load...")
     try:
         Base.metadata.drop_all(bind=engine)
         Base.metadata.create_all(bind=engine)
-        logger.info("'papers' table reset.")
     except Exception as e:
         db.rollback()
-        logger.error(f"Failed to reset table: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to reset database: {e}")
 
-    # Fetch gist metadata
     api_url = f"https://api.github.com/gists/{gist_id}"
     logger.info(f"Fetching gist metadata: {api_url}")
     try:
         response = requests.get(api_url)
         response.raise_for_status()
         gist_data = response.json()
-        files = gist_data.get("files", {})
     except requests.exceptions.RequestException as e:
-        logger.error(f"Gist fetch error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch Gist metadata: {e}")
 
+    files = gist_data.get("files", {})
     if not files:
         raise HTTPException(status_code=404, detail="No files found in the specified Gist.")
 
     to_ingest: List[Paper] = []
-
     for filename, file_info in files.items():
         raw_url = file_info.get("raw_url")
         if not raw_url:
-            logger.warning(f"File '{filename}' has no raw_url; skipping.")
             continue
-
-        logger.info(f"Fetching file: {filename}")
         try:
             content_resp = requests.get(raw_url)
             content_resp.raise_for_status()
@@ -244,57 +394,41 @@ async def bulk_load_gist(gist_id: str, db: SessionLocal = Depends(get_db)):
             logger.error(f"Content fetch error for {raw_url}: {e}")
             continue
 
-        # --- CHUNKING ---
-        chunks = chunk_text_words(content, size=1000, overlap=200)
-        if not chunks:
-            # fallback: at least create one chunk if empty split
-            chunks = [content]
-
+        chunks = chunk_text_words(content, size=1000, overlap=200) or [content]
         for i, chunk in enumerate(chunks):
             emb = embedding_model.encode(chunk).tolist()
-            to_ingest.append(
-                Paper(
-                    title=f"{filename}::chunk_{i:03d}",
-                    abstract=chunk,
-                    authors="Gist User",
-                    url=raw_url,
-                    embedding=emb,
-                )
-            )
+            to_ingest.append(Paper(
+                title=f"{filename}::chunk_{i:03d}",
+                abstract=chunk,
+                authors="Gist User",
+                url=raw_url,
+                embedding=emb,
+            ))
 
-    logger.info(f"Ingesting {len(to_ingest)} chunks...")
     try:
         db.bulk_save_objects(to_ingest)
         db.commit()
     except Exception as e:
         db.rollback()
-        logger.error(f"Ingestion failed: {e}")
         raise HTTPException(status_code=500, detail=f"Database ingestion failed: {e}")
 
     return {"message": f"Ingested {len(to_ingest)} chunks from gist {gist_id}.", "chunks_ingested": len(to_ingest)}
 
 @app.post("/ingest-gist-file", status_code=status.HTTP_201_CREATED)
 async def ingest_gist_file(request_body: IngestGistFileRequest, db: SessionLocal = Depends(get_db)):
-    """
-    Fetches a single file from a Gist, CHUNKS it, and ingests chunks.
-    """
-    global embedding_model
     if embedding_model is None:
         raise HTTPException(status_code=500, detail="Embedding model not loaded.")
-
     api_url = f"https://api.github.com/gists/{request_body.gist_id}"
     try:
         response = requests.get(api_url)
         response.raise_for_status()
         gist_data = response.json()
-        files = gist_data.get("files", {})
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch Gist metadata: {e}")
 
-    file_info = files.get(request_body.filename)
+    file_info = gist_data.get("files", {}).get(request_body.filename)
     if not file_info:
         raise HTTPException(status_code=404, detail=f"File '{request_body.filename}' not found in the gist.")
-
     raw_url = file_info.get("raw_url")
     if not raw_url:
         raise HTTPException(status_code=500, detail=f"Raw URL not found for '{request_body.filename}'.")
@@ -306,34 +440,27 @@ async def ingest_gist_file(request_body: IngestGistFileRequest, db: SessionLocal
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch content from {raw_url}: {e}")
 
-    chunks = chunk_text_words(content, size=1000, overlap=200)
-    if not chunks:
-        chunks = [content]
-
-    objects = []
+    chunks = chunk_text_words(content, size=1000, overlap=200) or [content]
+    objs = []
     for i, chunk in enumerate(chunks):
         emb = embedding_model.encode(chunk).tolist()
-        objects.append(
-            Paper(
-                title=f"{request_body.filename}::chunk_{i:03d}",
-                abstract=chunk,
-                authors="Gist User",
-                url=raw_url,
-                embedding=emb,
-            )
-        )
-
+        objs.append(Paper(
+            title=f"{request_body.filename}::chunk_{i:03d}",
+            abstract=chunk,
+            authors="Gist User",
+            url=raw_url,
+            embedding=emb,
+        ))
     try:
-        db.bulk_save_objects(objects)
+        db.bulk_save_objects(objs)
         db.commit()
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database ingestion failed: {e}")
 
-    return {"message": f"Ingested {len(objects)} chunks from '{request_body.filename}'."}
+    return {"message": f"Ingested {len(objs)} chunks from '{request_body.filename}'."}
 
-# --- Query / Similarity ---
-
+# -------- Querying --------
 class QueryRequest(BaseModel):
     query: str
     limit: int = 5
@@ -374,35 +501,26 @@ def search_db_for_vectors_filtered_sync(db: SessionLocal, query_embedding_list: 
         return []
 
 def search_db_by_keywords_sync(db: SessionLocal, query_text: str, limit: int) -> List[Paper]:
-    """
-    Simple keyword fallback using ILIKE on title/abstract.
-    """
     tokens = tokenize_query_for_keywords(query_text)
     if not tokens:
         return []
-    ilike_terms = [Paper.title.ilike(f"%{t}%") for t in tokens] + [Paper.abstract.ilike(f"%{t}%") for t in tokens]
+    ilikes = [Paper.title.ilike(f"%{t}%") for t in tokens] + [Paper.abstract.ilike(f"%{t}%") for t in tokens]
     try:
-        return (
-            db.query(Paper)
-            .filter(or_(*ilike_terms))
-            .limit(limit)
-            .all()
-        )
+        return db.query(Paper).filter(or_(*ilikes)).limit(limit).all()
     except Exception as e:
         logger.error(f"Keyword search error: {e}")
         return []
 
+def build_graph_from_chunks(chunks: List[Paper]) -> MiniGraph:
+    G = MiniGraph()
+    for p in chunks:
+        triples = extract_relations(p.abstract)
+        for (rel, a, b) in triples:
+            G.add(rel, a, b, p.title)
+    return G
+
 @app.post("/query")
 async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_db)):
-    """
-    Hybrid RAG:
-      - Embed query (cosine distance)
-      - Pull a wider vector pool (~4x limit)
-      - Pull keyword matches
-      - Merge & dedupe, then trim to final limit
-      - Strict prompt permits inverse family relations
-      - Deterministic LLM (temperature=0)
-    """
     global embedding_model, gemini_model, openai_client
 
     if embedding_model is None:
@@ -412,20 +530,15 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
     if not request_body.query:
         raise HTTPException(status_code=400, detail="Query parameter is required in the body.")
 
-    logger.info(f"Query: {request_body.query}")
     loop = asyncio.get_event_loop()
-
-    # 1) Embed and vector-retrieve a larger pool
     q_emb = embedding_model.encode([request_body.query])[0].tolist()
-    pool_k = max(request_body.limit, 5) * 4  # e.g., 5 -> 20
+    pool_k = max(request_body.limit, 5) * 4
+
     vec_pool = await loop.run_in_executor(executor, search_db_for_vectors_sync, db, q_emb, pool_k)
+    kw_pool  = await loop.run_in_executor(executor, search_db_by_keywords_sync, db, request_body.query, pool_k)
 
-    # 2) Keyword fallback pool
-    kw_pool = await loop.run_in_executor(executor, search_db_by_keywords_sync, db, request_body.query, pool_k)
-
-    # 3) Combine (vector order first), dedupe by id
-    combined = []
-    seen = set()
+    # Merge & dedupe by id (vector order first)
+    combined, seen = [], set()
     for p in vec_pool + kw_pool:
         if p.id not in seen:
             combined.append(p)
@@ -434,11 +547,26 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
     if not combined:
         return {"response": "I could not find any relevant documents in the knowledge base to answer your question."}
 
-    # 4) Trim to final limit for LLM context
     relevant = combined[:request_body.limit]
     documents_text = "\n\n".join([f"Title: {p.title}\nAuthors: {p.authors}\nAbstract: {p.abstract}" for p in relevant])
 
-    # 5) Strict prompt allowing inverse family relations
+    # ---------- NEW: Graph reasoning pass ----------
+    person, rel = parse_question(request_body.query)
+    graph_answers, graph_sources = ([], [])
+    if person and rel:
+        G = build_graph_from_chunks(relevant)
+        graph_answers, graph_sources = answer_from_graph(G, person, rel)
+
+    if graph_answers:
+        # Deterministic graph-derived answer with sources (no LLM)
+        return {
+            "response": ", ".join(graph_answers),
+            "llm_used": "graph",
+            "sources": graph_sources,
+            "relevant_documents": [{"title": p.title, "authors": p.authors, "url": p.url} for p in relevant],
+        }
+
+    # ---------- Fall back to LLM with stricter prompt ----------
     augmented_prompt = (
         "You are a factual QA assistant.\n"
         "RULES:\n"
@@ -455,12 +583,11 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
         f"{request_body.query}\n"
     )
 
-    logger.info("Sending to LLM...")
     try:
         llm_used = None
         llm_response = None
-
         provider = LLM_PROVIDER or ("gemini" if gemini_model else ("openai" if openai_client else ""))
+
         if provider == "openai" and openai_client:
             completion = openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",
@@ -478,7 +605,6 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
             llm_response = g.text
             llm_used = "gemini-2.0-flash"
         else:
-            # fallback to whichever is available
             if gemini_model:
                 gen_cfg = {"temperature": 0.0, "top_p": 0.1, "top_k": 1, "max_output_tokens": 512}
                 g = gemini_model.generate_content(augmented_prompt, generation_config=gen_cfg)
@@ -499,69 +625,45 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
         return {
             "response": llm_response,
             "llm_used": llm_used,
-            "relevant_documents": [
-                {"title": p.title, "authors": p.authors, "url": p.url, "abstract": p.abstract} for p in relevant
-            ],
+            "relevant_documents": [{"title": p.title, "authors": p.authors, "url": p.url} for p in relevant],
         }
     except Exception as e:
         logger.error(f"LLM generation error: {e}")
         raise HTTPException(status_code=500, detail=f"LLM generation failed: {e}")
 
+# -------- Similarity helpers --------
 @app.post("/find-similar-gist-docs")
 async def find_similar_gist_docs(request_body: SimilarGistDocsRequest, db: SessionLocal = Depends(get_db)):
-    """
-    Finds documents similar to a given document title (now chunk-friendly).
-    If you pass a base filename ('file.txt'), it will match chunked titles like 'file.txt::chunk_000'.
-    """
-    global embedding_model
     if embedding_model is None:
         raise HTTPException(status_code=500, detail="Embedding model not loaded.")
 
-    # More flexible match against chunked titles
     target_paper = (
         db.query(Paper)
         .filter(Paper.title.ilike(f"{request_body.document_title}%"))
         .first()
     )
-
     if not target_paper:
         raise HTTPException(status_code=404, detail=f"Document with title starting '{request_body.document_title}' not found.")
 
     target_embedding = target_paper.embedding
-
     relevant_papers = await asyncio.get_event_loop().run_in_executor(
         executor, search_db_for_vectors_filtered_sync, db, target_embedding, request_body.limit + 1, target_paper.title
     )
-
-    filtered_results = [p for p in relevant_papers if p.title != target_paper.title]
-    if not filtered_results:
+    filtered = [p for p in relevant_papers if p.title != target_paper.title]
+    if not filtered:
         return {"message": f"No similar documents found for '{request_body.document_title}'."}
-
-    return {
-        "similar_documents": [
-            {"title": p.title, "authors": p.authors, "url": p.url, "abstract": p.abstract} for p in filtered_results
-        ]
-    }
+    return {"similar_documents": [{"title": p.title, "authors": p.authors, "url": p.url, "abstract": p.abstract} for p in filtered]}
 
 @app.post("/find-similar-llm")
 async def find_similar_llm(request_body: SimilarLLMRequest, db: SessionLocal = Depends(get_db)):
-    """
-    Uses an LLM to generate a search query from a document title and then finds similar articles.
-    """
-    global embedding_model, gemini_model, openai_client
-
     if embedding_model is None:
         raise HTTPException(status_code=500, detail="Embedding model not loaded.")
     if gemini_model is None and openai_client is None:
         raise HTTPException(status_code=500, detail="No LLM API configured.")
 
-    prompt = (
-        f"Generate a semantic search query for academic papers about the topic of: '{request_body.document_title}'. "
-        "The query should be a single, concise sentence."
-    )
-
+    prompt = (f"Generate a semantic search query for academic papers about the topic of: '{request_body.document_title}'. "
+              "The query should be a single, concise sentence.")
     try:
-        llm_response = None
         if request_body.llm_type == "gemini" and gemini_model:
             gen_cfg = {"temperature": 0.0, "top_p": 0.1, "top_k": 1, "max_output_tokens": 128}
             g = gemini_model.generate_content(prompt, generation_config=gen_cfg)
@@ -575,10 +677,6 @@ async def find_similar_llm(request_body: SimilarLLMRequest, db: SessionLocal = D
             llm_response = c.choices[0].message.content
         else:
             raise HTTPException(status_code=400, detail=f"Invalid LLM type '{request_body.llm_type}' or API not configured.")
-
-        if not llm_response:
-            raise HTTPException(status_code=500, detail="LLM failed to generate a query.")
-
         generated_query = llm_response.strip().strip('"')
     except Exception as e:
         logger.error(f"LLM query generation error: {e}")
@@ -588,12 +686,6 @@ async def find_similar_llm(request_body: SimilarLLMRequest, db: SessionLocal = D
     relevant = await asyncio.get_event_loop().run_in_executor(
         executor, search_db_for_vectors_sync, db, q_emb, request_body.limit
     )
-
     if not relevant:
         return {"message": "No similar documents found based on the LLM-generated query."}
-
-    return {
-        "similar_documents": [
-            {"title": p.title, "authors": p.authors, "url": p.url, "abstract": p.abstract} for p in relevant
-        ]
-    }
+    return {"similar_documents": [{"title": p.title, "authors": p.authors, "url": p.url, "abstract": p.abstract} for p in relevant]}
