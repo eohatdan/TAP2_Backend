@@ -62,13 +62,13 @@ class Paper(Base):
 app = FastAPI(
     title="The Aboutness Project Backend API",
     description="API for semantic search and RAG for academic papers.",
-    version="0.4.1",
+    version="0.5.0",
 )
 
 # CORS: allow your GitHub Pages domain (any path under it)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[],  # use regex instead for flexibility
+    allow_origins=[],  # use regex for flexibility
     allow_origin_regex=r"^https://eohatdan\.github\.io($|/.*)",
     allow_credentials=True,
     allow_methods=["*"],
@@ -106,10 +106,31 @@ IS = r"\s+is\s+"
 WAS = r"\s+was\s+"
 
 REL_PATTERNS = [
+    # A is the father/mother/... of B
     (re.compile(fr"({NAME})(?:{IS_THE}|{WAS_THE})(father|mother|son|daughter|husband|wife|spouse|parent|child){OF}({NAME})", re.IGNORECASE), "dir"),
-    (re.compile(fr"({NAME})(?:{IS}|{WAS})({NAME})'?s\s+(father|mother|son|daughter|husband|wife|spouse|parent|child)", re.IGNORECASE), "poss"),  # A is B's father
-    (re.compile(fr"({NAME})'?s\s+(father|mother|son|daughter|husband|wife|spouse|parent|child){IS}({NAME})", re.IGNORECASE), "inv"),  # B's father is A
+    # A is B's father
+    (re.compile(fr"({NAME})(?:{IS}|{WAS})({NAME})'?s\s+(father|mother|son|daughter|husband|wife|spouse|parent|child)", re.IGNORECASE), "poss"),
+    # B's father is A
+    (re.compile(fr"({NAME})'?s\s+(father|mother|son|daughter|husband|wife|spouse|parent|child){IS}({NAME})", re.IGNORECASE), "inv"),
 ]
+
+# Children blocks, single child, and no-children
+CHILDREN_BLOCK = re.compile(
+    fr"({NAME})\s+has\s+(?:one|two|three|four|five|\d+)\s+children?:\s*(.+?)(?:(?:\n\s*\n)|$)",
+    re.IGNORECASE | re.DOTALL
+)
+SINGLE_CHILD = re.compile(
+    fr"({NAME})\s+has\s+one\s+child:\s*({NAME})\s*\((son|daughter)\)\.?",
+    re.IGNORECASE
+)
+NO_CHILDREN = re.compile(
+    fr"({NAME})\s+has\s+no\s+children",
+    re.IGNORECASE
+)
+
+# Nicknames (alias)
+NICK_BOTH = re.compile(fr"({NAME})\s+is\s+the\s+nickname\s+of\s+both\s+({NAME})\s+and\s+({NAME})", re.IGNORECASE)
+NICK_ONE  = re.compile(fr"({NAME})\s+is\s+the\s+nickname\s+of\s+({NAME})", re.IGNORECASE)
 
 def rel_to_edges(subj: str, rel: str, obj: str) -> List[Tuple[str, str, str]]:
     s = normalize_name(subj)
@@ -127,8 +148,35 @@ def rel_to_edges(subj: str, rel: str, obj: str) -> List[Tuple[str, str, str]]:
         edges.append(("spouse_of", o, s))
     return edges
 
-def extract_relations(text: str) -> List[Tuple[str, str, str]]:
-    triples = []
+def _parse_children_lines(parent: str, block_text: str) -> List[Tuple[str, str, str]]:
+    """
+    Parse lines like:
+      Danny Dale Clarke (son)
+      Jessica Clarke Morales (daughter)
+      Tiana (daughter) , Matthew (son), and Marissa (daughter).
+    Returns parent_of edges.
+    """
+    edges: List[Tuple[str,str,str]] = []
+    candidates = re.split(r"[\n,]+", block_text)
+    for c in candidates:
+        m = re.search(fr"({NAME})\s*\(\s*(son|daughter)\s*\)\.?", c.strip(), re.IGNORECASE)
+        if m:
+            child_name = normalize_name(m.group(1))
+            rel = m.group(2).lower()
+            if rel in ("son", "daughter"):
+                edges.extend(rel_to_edges(child_name, "child", parent))
+    return edges
+
+def extract_relations(text: str) -> Tuple[List[Tuple[str, str, str]], Dict[str, List[str]]]:
+    """
+    Returns (triples, nicknames) where:
+      - triples: list of (rel, a, b) edges
+      - nicknames: mapping alias -> [full names]
+    """
+    triples: List[Tuple[str,str,str]] = []
+    nicknames: Dict[str, List[str]] = {}
+
+    # Base sentence patterns
     for pat, kind in REL_PATTERNS:
         for m in pat.finditer(text):
             if kind == "dir":
@@ -140,7 +188,38 @@ def extract_relations(text: str) -> List[Tuple[str, str, str]]:
             elif kind == "inv":
                 b, r, a = m.group(1), m.group(2), m.group(3)  # B's r is A
                 triples.extend(rel_to_edges(a, r, b))
-    return triples
+
+    # Children blocks
+    for m in CHILDREN_BLOCK.finditer(text):
+        parent = normalize_name(m.group(1))
+        block  = m.group(2)
+        triples.extend(_parse_children_lines(parent, block))
+
+    # Single child
+    for m in SINGLE_CHILD.finditer(text):
+        parent = normalize_name(m.group(1))
+        child  = normalize_name(m.group(2))
+        triples.extend(rel_to_edges(child, "child", parent))
+
+    # No-children statements: nothing to add
+
+    # Nicknames
+    for m in NICK_BOTH.finditer(text):
+        alias = normalize_name(m.group(1))
+        a = normalize_name(m.group(2))
+        b = normalize_name(m.group(3))
+        nicknames.setdefault(alias, [])
+        for full in (a, b):
+            if full not in nicknames[alias]:
+                nicknames[alias].append(full)
+    for m in NICK_ONE.finditer(text):
+        alias = normalize_name(m.group(1))
+        full  = normalize_name(m.group(2))
+        nicknames.setdefault(alias, [])
+        if full not in nicknames[alias]:
+            nicknames[alias].append(full)
+
+    return triples, nicknames
 
 # ---------------- Mini Graph ----------------
 class MiniGraph:
@@ -179,6 +258,41 @@ class MiniGraph:
 
     def sources_for(self, rel: str, a: str, b: str) -> Set[str]:
         return self.edge_sources.get((rel, a, b), set())
+
+def build_graph_from_chunks(chunks: List['Paper']) -> Tuple['MiniGraph', Dict[str, List[str]]]:
+    G = MiniGraph()
+    nick_map: Dict[str, List[str]] = {}
+    for p in chunks:
+        triples, nicks = extract_relations(p.abstract)
+        for (rel, a, b) in triples:
+            G.add(rel, a, b, p.title)
+        for alias, fulls in nicks.items():
+            nick_map.setdefault(alias, [])
+            for f in fulls:
+                if f not in nick_map[alias]:
+                    nick_map[alias].append(f)
+    return G, nick_map
+
+def graph_all_people(G: 'MiniGraph') -> Set[str]:
+    names = set(G.parents.keys()) | set(G.children.keys()) | set(G.spouses.keys())
+    for kids in G.parents.values(): names |= kids
+    for kids in G.children.values(): names |= kids
+    for sps in G.spouses.values(): names |= sps
+    return names
+
+def expand_person_candidates(person: str, G: 'MiniGraph', nick_map: Dict[str, List[str]]) -> List[str]:
+    cands = set([person])
+    # nickname expansions
+    if person in nick_map:
+        cands.update(nick_map[person])
+    # single-token first-name expansion
+    tokens = person.split()
+    if len(tokens) == 1:
+        token = tokens[0].lower()
+        for full in graph_all_people(G):
+            if any(t.lower() == token for t in full.split()):
+                cands.add(full)
+    return sorted(cands)
 
 REL_ALIASES = {
     "father": "father", "mother": "mother", "parent": "parent",
@@ -235,6 +349,7 @@ def answer_from_graph(G: MiniGraph, person: str, rel: str) -> Tuple[List[str], L
         gps = G.get_grandparents(person)
         for gp in gps:
             answers.add(gp)
+            # accumulate parent->child sources along the two-hop chain
             for p in G.get_parents(person):
                 sources.update(G.sources_for("parent_of", p, person))
                 if gp in G.get_parents(p):
@@ -477,14 +592,6 @@ def search_db_by_keywords_sync(db: SessionLocal, query_text: str, limit: int) ->
         logger.error(f"Keyword search error: {e}")
         return []
 
-def build_graph_from_chunks(chunks: List[Paper]) -> MiniGraph:
-    G = MiniGraph()
-    for p in chunks:
-        triples = extract_relations(p.abstract)
-        for (rel, a, b) in triples:
-            G.add(rel, a, b, p.title)
-    return G
-
 @app.post("/query")
 async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_db)):
     global embedding_model, gemini_model, openai_client
@@ -498,7 +605,7 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
 
     loop = asyncio.get_event_loop()
     q_emb = embedding_model.encode([request_body.query])[0].tolist()
-    pool_k = max(request_body.limit, 5) * 4  # e.g., 5 -> 20
+    pool_k = max(request_body.limit, 5) * 8  # wider recall
 
     vec_pool = await loop.run_in_executor(executor, search_db_for_vectors_sync, db, q_emb, pool_k)
     kw_pool  = await loop.run_in_executor(executor, search_db_by_keywords_sync, db, request_body.query, pool_k)
@@ -519,17 +626,25 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
     # Graph reasoning for kinship questions
     person, rel = parse_question(request_body.query)
     if person and rel:
-        G = build_graph_from_chunks(relevant)
-        graph_answers, graph_sources = answer_from_graph(G, person, rel)
-        if graph_answers:
+        G, nick_map = build_graph_from_chunks(relevant)
+        candidate_persons = expand_person_candidates(person, G, nick_map)
+
+        all_answers: Set[str] = set()
+        all_sources: Set[str] = set()
+        for cand in candidate_persons:
+            ans, srcs = answer_from_graph(G, cand, rel)
+            all_answers.update(ans)
+            all_sources.update(srcs)
+
+        if all_answers:
             return {
-                "response": ", ".join(graph_answers),
+                "response": ", ".join(sorted(all_answers)),
                 "llm_used": "graph",
-                "sources": graph_sources,
+                "sources": sorted(all_sources),
                 "relevant_documents": [{"title": p.title, "authors": p.authors, "url": p.url} for p in relevant],
             }
 
-    # Fall back to LLM with strict prompt
+    # Fall back to LLM with strict prompt (deterministic)
     augmented_prompt = (
         "You are a factual QA assistant.\n"
         "RULES:\n"
@@ -568,7 +683,6 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
             llm_response = g.text
             llm_used = "gemini-2.0-flash"
         else:
-            # fallback to whichever is available
             if gemini_model:
                 gen_cfg = {"temperature": 0.0, "top_p": 0.1, "top_k": 1, "max_output_tokens": 512}
                 g = gemini_model.generate_content(augmented_prompt, generation_config=gen_cfg)
@@ -596,6 +710,16 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
         raise HTTPException(status_code=500, detail=f"LLM generation failed: {e}")
 
 # ---------------- Similarity helpers ----------------
+class SimilarGistDocsRequest(BaseModel):
+    gist_id: str
+    document_title: str
+    limit: int = 3
+
+class SimilarLLMRequest(BaseModel):
+    document_title: str
+    limit: int = 3
+    llm_type: str = "gemini"
+
 @app.post("/find-similar-gist-docs")
 async def find_similar_gist_docs(request_body: SimilarGistDocsRequest, db: SessionLocal = Depends(get_db)):
     if embedding_model is None:
