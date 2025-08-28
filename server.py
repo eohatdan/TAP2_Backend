@@ -56,13 +56,13 @@ class Paper(Base):
     abstract = Column(String)
     authors = Column(String)
     url = Column(String)
-    embedding = Column(Vector(384))  # keep 384 dims (MiniLM/bge-small/e5-small families)
+    embedding = Column(Vector(384))  # keep 384 dims
 
 # ---------------- FastAPI ----------------
 app = FastAPI(
     title="The Aboutness Project Backend API",
     description="API for semantic search and RAG for academic papers.",
-    version="0.5.0",
+    version="0.5.1",
 )
 
 # CORS: allow your GitHub Pages domain (any path under it)
@@ -96,6 +96,13 @@ def tokenize_query_for_keywords(q: str) -> List[str]:
 def normalize_name(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip())
 
+# --------- NEW: retrieval-tuned embedding helpers (E5 with prefixes + normalization) ---------
+def embed_doc(text: str) -> List[float]:
+    return embedding_model.encode("passage: " + text, normalize_embeddings=True).tolist()
+
+def embed_query(text: str) -> List[float]:
+    return embedding_model.encode("query: " + text, normalize_embeddings=True).tolist()
+
 # ---------------- Relation Extraction ----------------
 # Supported: father, mother, parent, son, daughter, child, husband, wife, spouse (+ grandparents via reasoning)
 NAME = r"[A-Z][a-z]+(?: [A-Z][a-z]+){0,3}"  # up to 4 tokens
@@ -120,7 +127,7 @@ CHILDREN_BLOCK = re.compile(
     re.IGNORECASE | re.DOTALL
 )
 SINGLE_CHILD = re.compile(
-    fr"({NAME})\s+has\s+one\s+child:\s*({NAME})\s*\((son|daughter)\)\.?",
+    fr"({NAME})\s+has\s+one\s+child:\s*({NAME})\s*\((son|daughter)\.?\)\.?",
     re.IGNORECASE
 )
 NO_CHILDREN = re.compile(
@@ -159,7 +166,7 @@ def _parse_children_lines(parent: str, block_text: str) -> List[Tuple[str, str, 
     edges: List[Tuple[str,str,str]] = []
     candidates = re.split(r"[\n,]+", block_text)
     for c in candidates:
-        m = re.search(fr"({NAME})\s*\(\s*(son|daughter)\s*\)\.?", c.strip(), re.IGNORECASE)
+        m = re.search(fr"({NAME})\s*\(\s*(son|daughter)\.?\s*\)\.?", c.strip(), re.IGNORECASE)
         if m:
             child_name = normalize_name(m.group(1))
             rel = m.group(2).lower()
@@ -282,16 +289,37 @@ def graph_all_people(G: 'MiniGraph') -> Set[str]:
 
 def expand_person_candidates(person: str, G: 'MiniGraph', nick_map: Dict[str, List[str]]) -> List[str]:
     cands = set([person])
+    names = graph_all_people(G)
+
     # nickname expansions
     if person in nick_map:
         cands.update(nick_map[person])
-    # single-token first-name expansion
-    tokens = person.split()
-    if len(tokens) == 1:
-        token = tokens[0].lower()
-        for full in graph_all_people(G):
-            if any(t.lower() == token for t in full.split()):
+
+    tokens = person.lower().split()
+
+    # multi-token: match if all tokens appear in order in the full name
+    if len(tokens) >= 2:
+        for full in names:
+            ftoks = full.lower().split()
+            i = 0
+            ok = True
+            for t in tokens:
+                try:
+                    j = ftoks.index(t, i)
+                    i = j + 1
+                except ValueError:
+                    ok = False
+                    break
+            if ok:
                 cands.add(full)
+
+    # single-token fallback: match any full name containing the token
+    if len(tokens) == 1:
+        token = tokens[0]
+        for full in names:
+            if any(t == token for t in full.lower().split()):
+                cands.add(full)
+
     return sorted(cands)
 
 REL_ALIASES = {
@@ -380,8 +408,9 @@ async def startup_event():
 
     global embedding_model
     try:
-        logger.info("Loading embedding model...")
-        embedding_model = SentenceTransformer("all-MiniLM-L6-v2")  # 384-dim
+        logger.info("Loading retrieval embedding model (e5-small-v2)...")
+        # Retrieval-tuned 384-d model (compatible with existing schema)
+        embedding_model = SentenceTransformer("intfloat/e5-small-v2")
         logger.info("Embedding model loaded.")
     except Exception as e:
         logger.error(f"Embedding model load error: {e}")
@@ -476,7 +505,7 @@ async def bulk_load_gist(gist_id: str, db: SessionLocal = Depends(get_db)):
 
         chunks = chunk_text_words(content, size=1000, overlap=200) or [content]
         for i, chunk in enumerate(chunks):
-            emb = embedding_model.encode(chunk).tolist()
+            emb = embed_doc(chunk)  # <<< E5 doc embedding
             to_ingest.append(Paper(
                 title=f"{filename}::chunk_{i:03d}",
                 abstract=chunk,
@@ -524,7 +553,7 @@ async def ingest_gist_file(request_body: IngestGistFileRequest, db: SessionLocal
     chunks = chunk_text_words(content, size=1000, overlap=200) or [content]
     objs = []
     for i, chunk in enumerate(chunks):
-        emb = embedding_model.encode(chunk).tolist()
+        emb = embed_doc(chunk)  # <<< E5 doc embedding
         objs.append(Paper(
             title=f"{request_body.filename}::chunk_{i:03d}",
             abstract=chunk,
@@ -604,7 +633,7 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
         raise HTTPException(status_code=400, detail="Query parameter is required in the body.")
 
     loop = asyncio.get_event_loop()
-    q_emb = embedding_model.encode([request_body.query])[0].tolist()
+    q_emb = embed_query(request_body.query)  # <<< E5 query embedding
     pool_k = max(request_body.limit, 5) * 8  # wider recall
 
     vec_pool = await loop.run_in_executor(executor, search_db_for_vectors_sync, db, q_emb, pool_k)
@@ -620,10 +649,11 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
     if not combined:
         return {"response": "I could not find any relevant documents in the knowledge base to answer your question."}
 
+    # Keep top-k for LLM; (optionally: build graph from broader pool by changing here)
     relevant = combined[:request_body.limit]
     documents_text = "\n\n".join([f"Title: {p.title}\nAuthors: {p.authors}\nAbstract: {p.abstract}" for p in relevant])
 
-    # Graph reasoning for kinship questions
+    # Graph reasoning for kinship questions (built on the 'relevant' set)
     person, rel = parse_question(request_body.query)
     if person and rel:
         G, nick_map = build_graph_from_chunks(relevant)
@@ -771,7 +801,7 @@ async def find_similar_llm(request_body: SimilarLLMRequest, db: SessionLocal = D
         logger.error(f"LLM query generation error: {e}")
         raise HTTPException(status_code=500, detail=f"LLM query generation failed: {e}")
 
-    q_emb = embedding_model.encode([generated_query])[0].tolist()
+    q_emb = embed_query(generated_query)  # <<< E5 query embedding
     relevant = await asyncio.get_event_loop().run_in_executor(
         executor, search_db_for_vectors_sync, db, q_emb, request_body.limit
     )
