@@ -715,16 +715,16 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
         raise HTTPException(status_code=400, detail="Query parameter is required in the body.")
 
     # 1) SQL-first deterministic answering for family relations
-   person, rel = parse_question(request_body.query)
-if person and rel:
-    names, srcs, prov = answer_with_sql(db, person, rel)
-    if names:
-        return {
-            "response": ", ".join(names),
-            "llm_used": "sql-graph",
-            "provenance": prov,   # "manual" or "auto"
-            "sources": srcs
-        }
+    person, rel = parse_question(request_body.query)
+    if person and rel:
+        names, srcs, prov = answer_with_sql(db, person, rel)
+        if names:
+            return {
+                "response": ", ".join(names),
+                "llm_used": "sql-graph",
+                "provenance": prov,   # "manual" or "auto"
+                "sources": srcs
+            }
 
     # 2) If not a relation (or no SQL facts), do hybrid retrieval
     loop = asyncio.get_event_loop()
