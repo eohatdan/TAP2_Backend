@@ -899,3 +899,23 @@ async def find_similar_llm(request_body: SimilarLLMRequest, db: SessionLocal = D
     if not relevant:
         return {"message": "No similar documents found based on the LLM-generated query."}
     return {"similar_documents": [{"title": p.title, "authors": p.authors, "url": p.url, "abstract": p.abstract} for p in relevant]}
+# --- debug: what DB am I on & which tables exist?
+@app.get("/debug/db")
+def debug_db(db: SessionLocal = Depends(get_db)):
+    rows = db.execute(text(
+        "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename"
+    )).fetchall()
+    from urllib.parse import urlparse
+    u = urlparse(os.environ.get("DATABASE_URL", ""))
+    return {
+        "app_version": app.version,                 # should be 0.6.0 in the file I sent
+        "db": u.path.lstrip("/"),
+        "host": u.hostname,
+        "tables": [r[0] for r in rows],
+    }
+
+# --- admin: create any missing tables (safe; no drops)
+@app.post("/admin/create-missing-tables")
+def create_missing_tables():
+    Base.metadata.create_all(bind=engine)
+    return {"status": "created_if_missing"}
