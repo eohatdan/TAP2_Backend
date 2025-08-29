@@ -330,10 +330,12 @@ REL_ALIASES = {
     "grandfather": "grandparent", "grandmother": "grandparent", "grandparent": "grandparent",
 }
 
+# accept straight ' and curly ’; apostrophe optional before s
 Q_PATTERNS = [
-    re.compile(r"who\s+is\s+(.+?)'s\s+([a-z]+)\??", re.IGNORECASE),
+    re.compile(r"who\s+is\s+(.+?)[’']?s\s+([a-z]+)\??", re.IGNORECASE),
     re.compile(r"who\s+is\s+the\s+([a-z]+)\s+of\s+(.+?)\??", re.IGNORECASE),
 ]
+
 
 def parse_question(q: str) -> Tuple[str, str]:
     q = q.strip()
@@ -596,26 +598,27 @@ def sql_person_candidates(db, person: str):
 def answer_with_sql(db, person: str, rel: str):
     cands = sql_person_candidates(db, person)
 
-    def dedup(items):  # preserve order
+    def dedup(items):
         out, seen = [], set()
         for it in items:
             if it not in seen:
                 out.append(it); seen.add(it)
         return out
 
-    # Helper to query manual first, else auto
+    used_manual_any = False
+    answers, sources = [], []
+
     def fetch_manual_then_auto(sql_manual: str, sql_auto: str, params: dict):
+        nonlocal used_manual_any
         rows_m = db.execute(text(sql_manual), params).fetchall()
         if rows_m:
-            return rows_m, True
-        rows_a = db.execute(text(sql_auto), params).fetchall()
-        return rows_a, False
-
-    answers, sources = [], []
+            used_manual_any = True
+            return rows_m
+        return db.execute(text(sql_auto), params).fetchall()
 
     if rel in ("father","mother","parent"):
         for c in cands:
-            rows, used_manual = fetch_manual_then_auto(
+            rows = fetch_manual_then_auto(
                 "SELECT parent, source FROM manual_relations WHERE child = :c",
                 "SELECT parent, source FROM relations WHERE child = :c",
                 {"c": c}
@@ -624,7 +627,7 @@ def answer_with_sql(db, person: str, rel: str):
 
     elif rel in ("son","daughter","child"):
         for c in cands:
-            rows, used_manual = fetch_manual_then_auto(
+            rows = fetch_manual_then_auto(
                 "SELECT child, source FROM manual_relations WHERE parent = :c",
                 "SELECT child, source FROM relations WHERE parent = :c",
                 {"c": c}
@@ -633,24 +636,22 @@ def answer_with_sql(db, person: str, rel: str):
 
     elif rel == "spouse":
         for c in cands:
-            rows, used_manual = fetch_manual_then_auto(
-                """
+            rows_m = db.execute(text("""
                 SELECT b, source FROM manual_spouses WHERE a = :c
-                UNION
-                SELECT a, source FROM manual_spouses WHERE b = :c
-                """,
-                """
-                SELECT b, source FROM spouses WHERE a = :c
-                UNION
-                SELECT a, source FROM spouses WHERE b = :c
-                """,
-                {"c": c}
-            )
+                UNION SELECT a, source FROM manual_spouses WHERE b = :c
+            """), {"c": c}).fetchall()
+            if rows_m:
+                used_manual_any = True
+                rows = rows_m
+            else:
+                rows = db.execute(text("""
+                    SELECT b, source FROM spouses WHERE a = :c
+                    UNION SELECT a, source FROM spouses WHERE b = :c
+                """), {"c": c}).fetchall()
             answers += [r[0] for r in rows]; sources += [r[1] for r in rows]
 
     elif rel == "grandparent":
         for c in cands:
-            # manual two-hop; if none → auto two-hop
             rows_m = db.execute(text("""
                 SELECT DISTINCT gp.parent, p.source, gp.source
                 FROM manual_relations p
@@ -658,21 +659,24 @@ def answer_with_sql(db, person: str, rel: str):
                 WHERE p.child = :c
             """), {"c": c}).fetchall()
             if rows_m:
+                used_manual_any = True
                 answers += [r[0] for r in rows_m]
                 for r in rows_m: sources += [r[1], r[2]]
-                continue
-            rows_a = db.execute(text("""
-                SELECT DISTINCT gp.parent, p.source, gp.source
-                FROM relations p
-                JOIN relations gp ON gp.child = p.parent
-                WHERE p.child = :c
-            """), {"c": c}).fetchall()
-            answers += [r[0] for r in rows_a]
-            for r in rows_a: sources += [r[1], r[2]]
+            else:
+                rows_a = db.execute(text("""
+                    SELECT DISTINCT gp.parent, p.source, gp.source
+                    FROM relations p
+                    JOIN relations gp ON gp.child = p.parent
+                    WHERE p.child = :c
+                """), {"c": c}).fetchall()
+                answers += [r[0] for r in rows_a]
+                for r in rows_a: sources += [r[1], r[2]]
 
     answers = dedup(answers)
     sources = dedup([s for s in sources if s])
-    return answers, sources
+    provenance = "manual" if used_manual_any else ("auto" if answers else "none")
+    return answers, sources, provenance
+
 
 # ---------------- Retrieval helpers ----------------
 def search_db_for_vectors_sync(db: SessionLocal, query_embedding_list: List[float], limit: int) -> List[Paper]:
@@ -711,11 +715,16 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
         raise HTTPException(status_code=400, detail="Query parameter is required in the body.")
 
     # 1) SQL-first deterministic answering for family relations
-    person, rel = parse_question(request_body.query)
-    if person and rel:
-        names, srcs = answer_with_sql(db, person, rel)
-        if names:
-            return {"response": ", ".join(names), "llm_used": "sql-graph", "sources": srcs}
+   person, rel = parse_question(request_body.query)
+if person and rel:
+    names, srcs, prov = answer_with_sql(db, person, rel)
+    if names:
+        return {
+            "response": ", ".join(names),
+            "llm_used": "sql-graph",
+            "provenance": prov,   # "manual" or "auto"
+            "sources": srcs
+        }
 
     # 2) If not a relation (or no SQL facts), do hybrid retrieval
     loop = asyncio.get_event_loop()
