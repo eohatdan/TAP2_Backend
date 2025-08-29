@@ -845,4 +845,57 @@ def search_db_for_vectors_filtered_sync(db: SessionLocal, query_embedding_list: 
         return []
 
 @app.post("/find-similar-gist-docs")
-async def find_similar_gist_docs(request_body
+async def find_similar_gist_docs(request_body: SimilarGistDocsRequest, db: SessionLocal = Depends(get_db)):
+    if embedding_model is None:
+        raise HTTPException(status_code=500, detail="Embedding model not loaded.")
+    target_paper = (
+        db.query(Paper)
+        .filter(Paper.title.ilike(f"{request_body.document_title}%"))
+        .first()
+    )
+    if not target_paper:
+        raise HTTPException(status_code=404, detail=f"Document with title starting '{request_body.document_title}' not found.")
+    target_embedding = target_paper.embedding
+    relevant_papers = await asyncio.get_event_loop().run_in_executor(
+        executor, search_db_for_vectors_filtered_sync, db, target_embedding, request_body.limit + 1, target_paper.title
+    )
+    filtered = [p for p in relevant_papers if p.title != target_paper.title]
+    if not filtered:
+        return {"message": f"No similar documents found for '{request_body.document_title}'."}
+    return {"similar_documents": [{"title": p.title, "authors": p.authors, "url": p.url, "abstract": p.abstract} for p in filtered]}
+
+@app.post("/find-similar-llm")
+async def find_similar_llm(request_body: SimilarLLMRequest, db: SessionLocal = Depends(get_db)):
+    if embedding_model is None:
+        raise HTTPException(status_code=500, detail="Embedding model not loaded.")
+    if gemini_model is None and openai_client is None:
+        raise HTTPException(status_code=500, detail="No LLM API configured.")
+
+    prompt = (f"Generate a semantic search query for academic papers about the topic of: '{request_body.document_title}'. "
+              "The query should be a single, concise sentence.")
+    try:
+        if request_body.llm_type == "gemini" and gemini_model:
+            gen_cfg = {"temperature": 0.0, "top_p": 0.1, "top_k": 1, "max_output_tokens": 128}
+            g = gemini_model.generate_content(prompt, generation_config=gen_cfg)
+            llm_response = g.text
+        elif request_body.llm_type == "openai" and openai_client:
+            c = openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                temperature=0.0,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            llm_response = c.choices[0].message.content
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid LLM type '{request_body.llm_type}' or API not configured.")
+        generated_query = llm_response.strip().strip('"')
+    except Exception as e:
+        logger.error(f"LLM query generation error: {e}")
+        raise HTTPException(status_code=500, detail=f"LLM query generation failed: {e}")
+
+    q_emb = embed_query(generated_query)
+    relevant = await asyncio.get_event_loop().run_in_executor(
+        executor, search_db_for_vectors_sync, db, q_emb, request_body.limit
+    )
+    if not relevant:
+        return {"message": "No similar documents found based on the LLM-generated query."}
+    return {"similar_documents": [{"title": p.title, "authors": p.authors, "url": p.url, "abstract": p.abstract} for p in relevant]}
