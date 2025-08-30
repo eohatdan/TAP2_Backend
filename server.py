@@ -236,16 +236,18 @@ def extract_relations(text: str) -> Tuple[List[Tuple[str, str, str]], Dict[str, 
     nicknames: Dict[str, List[str]] = {}
 
     for pat, kind in REL_PATTERNS:
-        for m in pat.finditer(text):
-            if kind == "dir":
-                a, r, b = m.group(1), m.group(2), m.group(3)
-                triples.extend(rel_to_edges(a, r, b))
-            elif kind == "poss":
-                a, b, r = m.group(1), m.group(2), m.group(3)
-                triples.extend(rel_to_edges(a, r, b))
-            elif kind == "inv":
-                b, r, a = m.group(1), m.group(2), m.group(3)
-                triples.extend(rel_to_edges(a, r, b))
+            for m in pat.finditer(text):
+                if kind == "dir":
+                    a0, r, b0 = m.group(1), m.group(2), m.group(3)
+                elif kind == "poss":
+                    a0, b0, r = m.group(1), m.group(2), m.group(3)
+                elif kind == "inv":
+                    b0, r, a0 = m.group(1), m.group(2), m.group(3)
+    
+                for (rel, a, b) in rel_to_edges(a0, r, b0):
+                    if is_person(a) and is_person(b):
+                        triples.append((rel, a, b))
+
 
     for m in CHILDREN_BLOCK.finditer(text):
         parent = normalize_name(m.group(1))
@@ -311,6 +313,27 @@ class MiniGraph:
 
     def sources_for(self, rel: str, a: str, b: str) -> Set[str]:
         return self.edge_sources.get((rel, a, b), set())
+        
+def answer_from_graph(G: 'MiniGraph', person: str, rel: str):
+    ans, srcs = set(), set()
+    if rel in ("father","mother","parent"):
+        for p in G.get_parents(person):
+            ans.add(p)
+            srcs |= G.sources_for("parent_of", p, person)
+    elif rel in ("son","daughter","child"):
+        for c in G.get_children(person):
+            ans.add(c)
+            srcs |= G.sources_for("parent_of", person, c)
+    elif rel == "spouse":
+        for s in G.get_spouses(person):
+            ans.add(s)
+            srcs |= G.sources_for("spouse_of", person, s)
+    elif rel == "grandparent":
+        for gp in G.get_grandparents(person):
+            ans.add(gp)
+            # (optional) we don’t track 2-hop sources here
+    return ans, srcs
+
 
 def build_graph_from_chunks(chunks: List['Paper']) -> Tuple['MiniGraph', Dict[str, List[str]]]:
     G = MiniGraph()
@@ -857,8 +880,14 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
             "relevant_documents": [{"title": p.title, "authors": p.authors, "url": p.url} for p in relevant],
         }
     except Exception as e:
-        # Keep request successful from the browser POV; show the error
-        return {"response": "LLM error", "error": str(e), "llm_used": None, "relevant_documents": [...]}
+        logger.error(f"LLM generation error: {e}")
+        return {
+            "response": "LLM error",
+            "error": str(e),
+            "llm_used": None,
+            "relevant_documents": [{"title": p.title, "authors": p.authors, "url": p.url} for p in relevant],
+        }
+
 
 # ---------------- Similarity helpers (unchanged endpoints) ----------------
 class SimilarGistDocsRequest(BaseModel):
