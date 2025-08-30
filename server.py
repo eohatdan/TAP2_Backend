@@ -23,7 +23,6 @@ from pgvector.sqlalchemy import Vector
 from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 import openai
-
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -111,14 +110,18 @@ app = FastAPI(
     version="0.6.0",
 )
 
-# CORS for GitHub Pages
+ALLOWED_ORIGINS = [
+    "https://eohatdan.github.io",   # your GitHub Pages origin
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[],
-    allow_origin_regex=r"^https://eohatdan\.github\.io($|/.*)",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,   # explicit origins (no regex)
+    allow_credentials=False,         # keep false unless you use cookies/auth
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "Accept"],
+    expose_headers=["Content-Type"],
+    max_age=86400,                   # cache preflight for a day
 )
 
 # ---------------- Utilities ----------------
