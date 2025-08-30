@@ -228,7 +228,8 @@ def _parse_children_lines(parent: str, block_text: str) -> List[Tuple[str, str, 
         m = re.search(fr"({NAME})\s*\(\s*(son|daughter)\.?\s*\)\.?", c.strip(), re.IGNORECASE)
         if m:
             child_name = normalize_name(m.group(1))
-            edges.extend(rel_to_edges(child_name, "child", parent))
+            if is_person(child_name) and is_person(parent):
+                edges.extend(rel_to_edges(child_name, "child", parent))
     return edges
 
 def extract_relations(text: str) -> Tuple[List[Tuple[str, str, str]], Dict[str, List[str]]]:
@@ -257,7 +258,9 @@ def extract_relations(text: str) -> Tuple[List[Tuple[str, str, str]], Dict[str, 
     for m in SINGLE_CHILD.finditer(text):
         parent = normalize_name(m.group(1))
         child  = normalize_name(m.group(2))
-        triples.extend(rel_to_edges(child, "child", parent))
+        if is_person(child) and is_person(parent):
+            triples.extend(rel_to_edges(child, "child", parent))
+
 
     for m in NICK_BOTH.finditer(text):
         alias = normalize_name(m.group(1))
