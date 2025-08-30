@@ -110,19 +110,32 @@ app = FastAPI(
     version="0.6.0",
 )
 
-ALLOWED_ORIGINS = [
-    "https://eohatdan.github.io",   # your GitHub Pages origin
-]
+from fastapi.middleware.cors import CORSMiddleware
+
+ALLOWED_ORIGINS = ["https://eohatdan.github.io"]  # exact origin, no trailing slash
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,   # explicit origins (no regex)
-    allow_credentials=False,         # keep false unless you use cookies/auth
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "Accept"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],  # include OPTIONS
+    allow_headers=["*"],                       # allow Content-Type, etc.
     expose_headers=["Content-Type"],
-    max_age=86400,                   # cache preflight for a day
+    max_age=86400,
 )
+
+from fastapi import Response
+
+@app.options("/{path:path}")
+def preflight_cors(path: str, response: Response):
+    origin = "https://eohatdan.github.io"
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, Accept"
+    response.headers["Access-Control-Max-Age"] = "86400"
+    return Response(status_code=204)
+
 
 # ---------------- Utilities ----------------
 def chunk_text_words(text: str, size: int = 1000, overlap: int = 200) -> List[str]:
@@ -176,6 +189,21 @@ SINGLE_CHILD = re.compile(
 
 NICK_BOTH = re.compile(fr"({NAME})\s+is\s+the\s+nickname\s+of\s+both\s+({NAME})\s+and\s+({NAME})", re.IGNORECASE)
 NICK_ONE  = re.compile(fr"({NAME})\s+is\s+the\s+nickname\s+of\s+({NAME})", re.IGNORECASE)
+
+PERSON = re.compile(r"^[A-Z][a-z]+(?: [A-Z][a-z]+){0,3}$")  # 1–4 capitalized tokens
+
+BAD_TOKENS = (
+    "High School","University","College","WV","San Jose","Huntington","California","West Virginia",
+    "degree","bachelor","masters","master’s","information","sciences","born","on","July","August",
+    "County","State","Road","Street","Avenue","Vin son","Vinson"
+)
+
+def is_person(name: str) -> bool:
+    n = normalize_name(name)
+    if any(x in n for x in BAD_TOKENS):
+        return False
+    return bool(PERSON.match(n))
+
 
 def rel_to_edges(subj: str, rel: str, obj: str) -> List[Tuple[str, str, str]]:
     s = normalize_name(subj)
@@ -829,8 +857,8 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
             "relevant_documents": [{"title": p.title, "authors": p.authors, "url": p.url} for p in relevant],
         }
     except Exception as e:
-        logger.error(f"LLM generation error: {e}")
-        raise HTTPException(status_code=500, detail=f"LLM generation failed: {e}")
+        # Keep request successful from the browser POV; show the error
+        return {"response": "LLM error", "error": str(e), "llm_used": None, "relevant_documents": [...]}
 
 # ---------------- Similarity helpers (unchanged endpoints) ----------------
 class SimilarGistDocsRequest(BaseModel):
