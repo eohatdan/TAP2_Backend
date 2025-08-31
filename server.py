@@ -173,10 +173,16 @@ IS = r"\s+is\s+"
 WAS = r"\s+was\s+"
 
 REL_PATTERNS = [
+    # A is the father of B
     (re.compile(fr"({NAME})(?:{IS_THE}|{WAS_THE})(father|mother|son|daughter|husband|wife|spouse|parent|child){OF}({NAME})", re.IGNORECASE), "dir"),
-    (re.compile(fr"({NAME})(?:{IS}|{WAS})({NAME})'?s\s+(father|mother|son|daughter|husband|wife|spouse|parent|child)", re.IGNORECASE), "poss"),
-    (re.compile(fr"({NAME})'?s\s+(father|mother|son|daughter|husband|wife|spouse|parent|child){IS}({NAME})", re.IGNORECASE), "inv"),
+
+    # A is B’s father   (REQUIRE apostrophe)
+    (re.compile(fr"({NAME})(?:{IS}|{WAS})({NAME})[’']s\s+(father|mother|son|daughter|husband|wife|spouse|parent|child)", re.IGNORECASE), "poss"),
+
+    # A’s father is B   (REQUIRE apostrophe)
+    (re.compile(fr"({NAME})[’']s\s+(father|mother|son|daughter|husband|wife|spouse|parent|child){IS}({NAME})", re.IGNORECASE), "inv"),
 ]
+
 
 CHILDREN_BLOCK = re.compile(
     fr"({NAME})\s+has\s+(?:one|two|three|four|five|\d+)\s+children?:\s*(.+?)(?:(?:\n\s*\n)|$)",
@@ -190,19 +196,22 @@ SINGLE_CHILD = re.compile(
 NICK_BOTH = re.compile(fr"({NAME})\s+is\s+the\s+nickname\s+of\s+both\s+({NAME})\s+and\s+({NAME})", re.IGNORECASE)
 NICK_ONE  = re.compile(fr"({NAME})\s+is\s+the\s+nickname\s+of\s+({NAME})", re.IGNORECASE)
 
-PERSON = re.compile(r"^[A-Z][a-z]+(?: [A-Z][a-z]+){0,3}$")  # 1–4 capitalized tokens
-
+PERSON = re.compile(r"^[A-Z][a-z]+(?: [A-Z][a-z]+){0,3}$")
 BAD_TOKENS = (
     "High School","University","College","WV","San Jose","Huntington","California","West Virginia",
     "degree","bachelor","masters","master’s","information","sciences","born","on","July","August",
     "County","State","Road","Street","Avenue","Vin son","Vinson"
 )
+PRONOUNS = {"I","You","He","She","We","They","His","Her","Their","Our","Your"}
 
 def is_person(name: str) -> bool:
     n = normalize_name(name)
+    if n in PRONOUNS:                # NEW: reject pronouns
+        return False
     if any(x in n for x in BAD_TOKENS):
         return False
     return bool(PERSON.match(n))
+
 
 
 def rel_to_edges(subj: str, rel: str, obj: str) -> List[Tuple[str, str, str]]:
@@ -388,10 +397,12 @@ REL_ALIASES = {
 }
 
 # accept straight ' and curly ’; apostrophe optional before s
+# Require a real apostrophe in X’s / X's; also support “the father of X”
 Q_PATTERNS = [
-    re.compile(r"who\s+is\s+(.+?)[’']?s\s+([a-z]+)\??", re.IGNORECASE),
-    re.compile(r"who\s+is\s+the\s+([a-z]+)\s+of\s+(.+?)\??", re.IGNORECASE),
+    re.compile(r"who\s+is\s+(.+?)[’']s\s+([a-z]+)\??", re.IGNORECASE),   # "who is Thomas’s father"
+    re.compile(r"who\s+is\s+the\s+([a-z]+)\s+of\s+(.+?)\??", re.IGNORECASE),  # "who is the father of Thomas"
 ]
+
 
 
 def parse_question(q: str) -> Tuple[str, str]:
