@@ -328,6 +328,47 @@ def build_graph_from_chunks(chunks: List['Paper']) -> Tuple['MiniGraph', Dict[st
                     nick_map[alias].append(f)
     return G, nick_map
 
+from sqlalchemy import text
+
+def _manual_person_ids(db, name: str):
+    """
+    Resolve a name to 0..N manual_persons.id.
+    Supports exact full-name and first+last-only matches (first_last_norm).
+    """
+    rows = db.execute(text("""
+        WITH q AS (SELECT :name AS n)
+        SELECT id
+        FROM manual_persons
+        WHERE lower(full_name) = lower((SELECT n FROM q))
+        UNION
+        SELECT id
+        FROM manual_persons
+        WHERE first_last_norm(full_name) = first_last_norm((SELECT n FROM q))
+    """), {"name": name}).fetchall()
+    return [r[0] for r in rows]
+
+def _manual_spouses_by_name(db, name: str):
+    """
+    Return list of (spouse_fullname, source) using manual_unions.
+    """
+    ids = _manual_person_ids(db, name)
+    if not ids:
+        return []
+    rows = db.execute(text("""
+        WITH x AS (SELECT unnest(:ids::uuid[]) AS id)
+        SELECT p.full_name AS spouse, u.source
+          FROM manual_unions u
+          JOIN x ON x.id = u.spouse1
+          JOIN manual_persons p ON p.id = u.spouse2
+        UNION ALL
+        SELECT p.full_name AS spouse, u.source
+          FROM manual_unions u
+          JOIN x ON x.id = u.spouse2
+          JOIN manual_persons p ON p.id = u.spouse1
+    """), {"ids": ids}).fetchall()
+    return rows
+
+
 def graph_all_people(G: 'MiniGraph') -> Set[str]:
     names = set(G.parents.keys()) | set(G.children.keys()) | set(G.spouses.keys())
     for kids in G.parents.values(): names |= kids
@@ -381,6 +422,16 @@ REL_ALIASES = {
     "husband": "spouse", "wife": "spouse", "spouse": "spouse",
     "grandfather": "grandparent", "grandmother": "grandparent", "grandparent": "grandparent",
 }
+
+REL_MAP.update({
+    "grandparents": "grandparent",
+    "grandparent":  "grandparent",
+    "grandfather":  "grandparent",
+    "grandmother":  "grandparent",
+    "grandchildren":"grandchild",
+    "grandchild":   "grandchild",
+})
+
 
 # Require apostrophe for possessive; also support "the father of X"
 Q_PATTERNS = [
@@ -636,15 +687,23 @@ def sql_person_candidates(db, person: str):
     tokens = person.lower().split()
     if tokens:
         name_rows = db.execute(text("""
-            SELECT parent FROM relations
-            UNION SELECT child FROM relations
-            UNION SELECT a FROM spouses
-            UNION SELECT b FROM spouses
-            UNION SELECT parent FROM manual_relations
-            UNION SELECT child FROM manual_relations
-            UNION SELECT a FROM manual_spouses
-            UNION SELECT b FROM manual_spouses
-        """)).fetchall()
+    -- Names from lightweight extracted tables (if ever populated)
+    SELECT parent  AS fullname FROM relations
+    UNION SELECT child       FROM relations
+    UNION SELECT a           FROM spouses
+    UNION SELECT b           FROM spouses
+
+    -- Names from new normalized manual model
+    UNION SELECT parent FROM manual_relations_v
+    UNION SELECT child  FROM manual_relations_v
+    UNION
+    SELECT p1.full_name FROM manual_unions u
+      JOIN manual_persons p1 ON p1.id = u.spouse1
+    UNION
+    SELECT p2.full_name FROM manual_unions u
+      JOIN manual_persons p2 ON p2.id = u.spouse2
+""")).fetchall()
+
         for (full,) in name_rows:
             ftoks = full.lower().split()
             i = 0; ok = True
@@ -681,7 +740,7 @@ def answer_with_sql(db, person: str, rel: str):
     if rel in ("father","mother","parent"):
         for c in cands:
             rows = fetch_manual_then_auto(
-                "SELECT parent, source FROM manual_relations WHERE child = :c",
+                "SELECT parent, source FROM manual_relations_v WHERE child = :c",
                 "SELECT parent, source FROM relations WHERE child = :c",
                 {"c": c}
             )
@@ -690,7 +749,7 @@ def answer_with_sql(db, person: str, rel: str):
     elif rel in ("son","daughter","child"):
         for c in cands:
             rows = fetch_manual_then_auto(
-                "SELECT child, source FROM manual_relations WHERE parent = :c",
+                "SELECT child, source FROM manual_relations_v WHERE parent = :c",
                 "SELECT child, source FROM relations WHERE parent = :c",
                 {"c": c}
             )
@@ -698,41 +757,75 @@ def answer_with_sql(db, person: str, rel: str):
 
     elif rel == "spouse":
         for c in cands:
+            # Try the normalized manual schema first
             rows_m = db.execute(text("""
-                SELECT b, source FROM manual_spouses WHERE a = :c
-                UNION SELECT a, source FROM manual_spouses WHERE b = :c
+                WITH ids AS (
+                  SELECT id FROM manual_persons
+                   WHERE lower(full_name) = lower(:c)
+                  UNION
+                  SELECT id FROM manual_persons
+                   WHERE first_last_norm(full_name) = first_last_norm(:c)
+                )
+                SELECT p.full_name AS spouse, u.source
+                FROM manual_unions u
+                JOIN ids i ON (i.id = u.spouse1 OR i.id = u.spouse2)
+                JOIN manual_persons p
+                  ON p.id = CASE WHEN u.spouse1 = i.id THEN u.spouse2 ELSE u.spouse1 END
             """), {"c": c}).fetchall()
+    
             if rows_m:
                 used_manual_any = True
                 rows = rows_m
             else:
+                # Fallback to the lightweight extracted table (if you still use it)
                 rows = db.execute(text("""
                     SELECT b, source FROM spouses WHERE a = :c
-                    UNION SELECT a, source FROM spouses WHERE b = :c
+                    UNION ALL
+                    SELECT a, source FROM spouses WHERE b = :c
                 """), {"c": c}).fetchall()
-            answers += [r[0] for r in rows]; sources += [r[1] for r in rows]
 
-    elif rel == "grandparent":
+        answers += [r[0] for r in rows]
+        sources += [r[1] for r in rows]
+
+
+    elif rel in ("grandparent",):
         for c in cands:
             rows_m = db.execute(text("""
-                SELECT DISTINCT gp.parent, p.source, gp.source
-                FROM manual_relations p
-                JOIN manual_relations gp ON gp.child = p.parent
-                WHERE p.child = :c
+                SELECT DISTINCT
+                       gp.parent AS person,
+                       p.source  AS src1,
+                       gp.source AS src2
+                FROM manual_relations_v p               -- p: (parent -> child)
+                JOIN manual_relations_v gp              -- gp: (grandparent -> parent)
+                  ON lower(gp.child) = lower(p.parent)
+                WHERE lower(p.child) = lower(:c)
             """), {"c": c}).fetchall()
-            if rows_m:
-                used_manual_any = True
-                answers += [r[0] for r in rows_m]
-                for r in rows_m: sources += [r[1], r[2]]
-            else:
-                rows_a = db.execute(text("""
-                    SELECT DISTINCT gp.parent, p.source, gp.source
-                    FROM relations p
-                    JOIN relations gp ON gp.child = p.parent
-                    WHERE p.child = :c
-                """), {"c": c}).fetchall()
-                answers += [r[0] for r in rows_a]
-                for r in rows_a: sources += [r[1], r[2]]
+
+        if rows_m:
+            used_manual_any = True
+            for person, s1, s2 in rows_m:
+                answers.append(person)
+                sources.append(_merge_src(s1, s2))
+
+    elif rel in ("grandchild",):
+        for c in cands:
+            rows_m = db.execute(text("""
+                SELECT DISTINCT
+                       gc.child  AS person,
+                       p.source  AS src1,
+                       gc.source AS src2
+                FROM manual_relations_v p               -- p: (parent -> child) where parent = candidate
+                JOIN manual_relations_v gc              -- gc: (child -> grandchild)
+                  ON lower(gc.parent) = lower(p.child)
+                WHERE lower(p.parent) = lower(:c)
+            """), {"c": c}).fetchall()
+
+        if rows_m:
+            used_manual_any = True
+            for person, s1, s2 in rows_m:
+                answers.append(person)
+                sources.append(_merge_src(s1, s2))
+
 
     answers = dedup(answers)
     sources = dedup([s for s in sources if s])
@@ -761,7 +854,12 @@ def search_db_by_keywords_sync(db: SessionLocal, query_text: str, limit: int) ->
         return db.query(Paper).filter(or_(*ilikes)).limit(limit).all()
     except Exception as e:
         logger.error(f"Keyword search error: {e}")
-        return []
+        return []  
+        
+def _merge_src(s1, s2):
+    parts = { (s1 or "").strip(), (s2 or "").strip() }
+    parts.discard("")
+    return "; ".join(sorted(parts)) or "manual"
 
 # ---------------- Query endpoint ----------------
 class QueryRequest(BaseModel):
