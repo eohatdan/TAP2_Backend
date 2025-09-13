@@ -25,6 +25,27 @@ from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 import openai
 
+# --- Relation & gender maps (define once) ---
+REL_MAP = {
+    # direct
+    "parent":"parent", "mother":"parent", "father":"parent",
+    "spouse":"spouse", "husband":"spouse", "wife":"spouse", "partner":"spouse",
+    "child":"child", "children":"child", "son":"child", "daughter":"child",
+    "sibling":"sibling", "siblings":"sibling", "brother":"sibling", "sister":"sibling",
+    # grand* aliases
+    "grandparent":"grandparent", "grandparents":"grandparent",
+    "grandfather":"grandparent", "grandmother":"grandparent",
+    "grandchild":"grandchild", "grandchildren":"grandchild",
+}
+
+GENDER_HINT = {
+    "father":"M", "mother":"F",
+    "grandfather":"M", "grandmother":"F",
+    "husband":"M", "wife":"F",
+    "son":"M", "daughter":"F",
+    "brother":"M", "sister":"F",
+}
+
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tap2")
@@ -416,26 +437,6 @@ def expand_person_candidates(person: str, G: 'MiniGraph', nick_map: Dict[str, Li
             if any(t == token for t in full.lower().split()):
                 cands.add(full)
     return sorted(cands)
-# --- Relation & gender maps (define once) ---
-REL_MAP = {
-    # direct
-    "parent":"parent", "mother":"parent", "father":"parent",
-    "spouse":"spouse", "husband":"spouse", "wife":"spouse", "partner":"spouse",
-    "child":"child", "children":"child", "son":"child", "daughter":"child",
-    "sibling":"sibling", "siblings":"sibling", "brother":"sibling", "sister":"sibling",
-    # grand* aliases
-    "grandparent":"grandparent", "grandparents":"grandparent",
-    "grandfather":"grandparent", "grandmother":"grandparent",
-    "grandchild":"grandchild", "grandchildren":"grandchild",
-}
-
-GENDER_HINT = {
-    "father":"M", "mother":"F",
-    "grandfather":"M", "grandmother":"F",
-    "husband":"M", "wife":"F",
-    "son":"M", "daughter":"F",
-    "brother":"M", "sister":"F",
-}
 
 REL_ALIASES = {
     "father": "father", "mother": "mother", "parent": "parent",
@@ -443,16 +444,6 @@ REL_ALIASES = {
     "husband": "spouse", "wife": "spouse", "spouse": "spouse",
     "grandfather": "grandparent", "grandmother": "grandparent", "grandparent": "grandparent",
 }
-
-REL_MAP.update({
-    "grandparents": "grandparent",
-    "grandparent":  "grandparent",
-    "grandfather":  "grandparent",
-    "grandmother":  "grandparent",
-    "grandchildren":"grandchild",
-    "grandchild":   "grandchild",
-})
-
 
 # Require apostrophe for possessive; also support "the father of X"
 Q_PATTERNS = [
