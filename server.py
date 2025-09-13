@@ -411,10 +411,31 @@ def expand_person_candidates(person: str, G: 'MiniGraph', nick_map: Dict[str, Li
             if ok: cands.add(full)
     if len(tokens) == 1:
         token = tokens[0]
+        token = token.lower()
         for full in names:
             if any(t == token for t in full.lower().split()):
                 cands.add(full)
     return sorted(cands)
+# --- Relation & gender maps (define once) ---
+REL_MAP = {
+    # direct
+    "parent":"parent", "mother":"parent", "father":"parent",
+    "spouse":"spouse", "husband":"spouse", "wife":"spouse", "partner":"spouse",
+    "child":"child", "children":"child", "son":"child", "daughter":"child",
+    "sibling":"sibling", "siblings":"sibling", "brother":"sibling", "sister":"sibling",
+    # grand* aliases
+    "grandparent":"grandparent", "grandparents":"grandparent",
+    "grandfather":"grandparent", "grandmother":"grandparent",
+    "grandchild":"grandchild", "grandchildren":"grandchild",
+}
+
+GENDER_HINT = {
+    "father":"M", "mother":"F",
+    "grandfather":"M", "grandmother":"F",
+    "husband":"M", "wife":"F",
+    "son":"M", "daughter":"F",
+    "brother":"M", "sister":"F",
+}
 
 REL_ALIASES = {
     "father": "father", "mother": "mother", "parent": "parent",
