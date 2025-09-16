@@ -887,23 +887,33 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
 
     # 1) SQL-first deterministic answering
     person, rel = parse_question(request_body.query)
+    sql_names_found = False
+    known_fact = ""
     if person and rel:
         names, srcs, prov = answer_with_sql(db, person, rel)
         if names:
-            return {
-                "response": ", ".join(names),
-                "llm_used": "sql-graph",
-                "provenance": prov,
-                "sources": srcs
-            }
+            sql_names_found = True
+            # If it's a pure kinship question (just "who is/are ..."), answer now from SQL
+            qlower = request_body.query.strip().lower()
+            pure_kinship = (("who is" in qlower or "who are" in qlower)
+                            and not re.search(r"\b(what|where|when|why|how|which|list|name)\b", qlower))
+            if pure_kinship:
+                return {
+                    "response": ", ".join(names),
+                    "llm_used": "sql-graph",
+                    "provenance": prov,
+                    "sources": srcs
+                }
+            # Otherwise, carry the fact forward to retrieval/LLM
+            known_fact = f"Known family fact: {person}'s {rel} is {', '.join(names)}."
 
     # 2) Hybrid retrieval for LLM
     loop = asyncio.get_event_loop()
-    q_emb = embed_query(request_body.query)
+    aug_query_text = (request_body.query + ("\n\n" + known_fact if known_fact else ""))
+    q_emb = embed_query(aug_query_text)
     pool_k = max(request_body.limit, 5) * 8
     vec_pool = await loop.run_in_executor(executor, search_db_for_vectors_sync, db, q_emb, pool_k)
-    kw_pool  = await loop.run_in_executor(executor, search_db_by_keywords_sync, db, request_body.query, pool_k)
-
+    kw_pool  = await loop.run_in_executor(executor, search_db_by_keywords_sync, db, aug_query_text, pool_k)
     combined, seen = [], set()
     for p in vec_pool + kw_pool:
         if p.id not in seen:
@@ -917,7 +927,7 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
     documents_text = "\n\n".join([f"Title: {p.title}\nAuthors: {p.authors}\nAbstract: {p.abstract}" for p in relevant])
 
     # 3) Graph fallback if it was a relation question but SQL empty
-    if person and rel:
+    if person and rel and not sql_names_found:
         G, nick_map = build_graph_from_chunks(context_pool)
         candidate_persons = expand_person_candidates(person, G, nick_map)
         all_answers, all_sources = set(), set()
@@ -947,7 +957,7 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
         f"{documents_text}\n"
         "```\n\n"
         "Question:\n"
-        f"{request_body.query}\n"
+        f"{request_body.query}\n" + (f"\nKnown facts:\n- {known_fact}\n" if known_fact else "")
     )
 
     try:
