@@ -219,6 +219,66 @@ BAD_TOKENS = (
     "County","State","Road","Street","Avenue","Vin son","Vinson"
 )
 PRONOUNS = {"I","You","He","She","We","They","His","Her","Their","Our","Your","Hers","Him"}
+import re
+
+# Optional: a few common synonyms -> canonical keys you already use in REL_MAP
+_REL_SYNONYMS = {
+    "granddad": "grandfather",
+    "grand-dad": "grandfather",
+    "grandpa": "grandfather",
+    "grandmom": "grandmother",
+    "grandma": "grandmother",
+    "mum": "mother",
+    "dad": "father",
+    "bro": "brother",
+    "sis": "sister",
+    "kids": "children",
+    "child": "children",   # treat singular as children for list-y queries
+}
+
+def _canon_rel(rel: str) -> str:
+    rel = rel.strip().lower()
+    if rel in _REL_SYNONYMS:
+        rel = _REL_SYNONYMS[rel]
+    # if your REL_MAP uses singular keys like 'child' not 'children', flip here
+    return rel
+
+# --- minimal kinship classifier ---
+def classify_question(q: str):
+    """
+    Returns (is_kinship: bool, subject: str|None, relation: str|None, remainder: str|None)
+    Supports:
+      - "Who is Matthew Clarke's grandfather?"
+      - "Who is the grandfather of Matthew Clarke?"
+      - "What company did Matthew Clarke's grandfather work for?"
+    """
+    import re
+    original = q
+    ql = re.sub(r"\s+", " ", (q or "").strip().lower())
+
+    # who is the <rel> of <name>
+    m = re.search(r"\bwho\s+is\s+(?:the\s+)?(?P<rel>[a-z\- ]+)\s+of\s+(?P<name>[a-z .'\-]+)", ql)
+    if not m:
+        # who is <name>'s <rel>
+        m = re.search(r"\bwho\s+is\s+(?P<name>[a-z .'\-]+?)'s\s+(?P<rel>[a-z\- ]+)", ql)
+    if not m:
+        # composite: <name>'s <rel> ...
+        m2 = re.search(r"(?P<name>[a-z .'\-]+?)'s\s+(?P<rel>[a-z\- ]+)", ql)
+        if not m2:
+            return (False, None, None, None)
+        subject = m2.group("name").strip(" ?.,")
+        relation = m2.group("rel").strip()
+        start, end = m2.span()
+        remainder = (original[:start] + original[end:]).strip(" ?.,")
+        return (True, subject, relation, remainder or None)
+
+    subject = m.group("name").strip(" ?.,")
+    relation = m.group("rel").strip()
+    start, end = m.span()
+    remainder = (original[:start] + original[end:]).strip(" ?.,")
+    return (True, subject, relation, remainder or None)
+# --- end classifier ---
+
 
 def is_person(name: str) -> bool:
     n = normalize_name(name)
@@ -878,76 +938,89 @@ class QueryRequest(BaseModel):
     query: str
     limit: int = 5
 
+from fastapi import HTTPException
+from sqlalchemy import text
+from typing import Dict, Any
+
 @app.post("/query")
-async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_db)):
-    if embedding_model is None:
-        raise HTTPException(status_code=500, detail="Embedding model not loaded.")
-    if not request_body.query:
+def query(request_body: "QueryRequest") -> Dict[str, Any]:  # keep your existing Pydantic model
+    user_q = (getattr(request_body, "query", None) or "").strip()
+    if not user_q:
         raise HTTPException(status_code=400, detail="Query parameter is required in the body.")
 
-    # 1) SQL-first deterministic answering
-    person, rel = parse_question(request_body.query)
-    sql_names_found = False
+    # ---- Stage 1: SQL kinship gate ------------------------------------------
+    is_kin, subject, relation, remainder = classify_question(user_q)
     known_fact = ""
-    if person and rel:
-        names, srcs, prov = answer_with_sql(db, person, rel)
-        if names:
-            sql_names_found = True
-            # If it's a pure kinship question (just "who is/are ..."), answer now from SQL
-            qlower = request_body.query.strip().lower()
-            pure_kinship = (("who is" in qlower or "who are" in qlower)
-                            and not re.search(r"\b(what|where|when|why|how|which|list|name)\b", qlower))
-            if pure_kinship:
-                return {
-                    "response": ", ".join(names),
-                    "llm_used": "sql-graph",
-                    "provenance": prov,
-                    "sources": srcs
-                }
-            # Otherwise, carry the fact forward to retrieval/LLM
-            known_fact = f"Known family fact: {person}'s {rel} is {', '.join(names)}."
+    sql_sources = []
+    stage = None
 
-    # 2) Hybrid retrieval for LLM
-    loop = asyncio.get_event_loop()
-    aug_query_text = (request_body.query + ("\n\n" + known_fact if known_fact else ""))
-    q_emb = embed_query(aug_query_text)
-    pool_k = max(request_body.limit, 5) * 8
-    vec_pool = await loop.run_in_executor(executor, search_db_for_vectors_sync, db, q_emb, pool_k)
-    kw_pool  = await loop.run_in_executor(executor, search_db_by_keywords_sync, db, aug_query_text, pool_k)
-    combined, seen = [], set()
-    for p in vec_pool + kw_pool:
-        if p.id not in seen:
-            combined.append(p); seen.add(p.id)
-    if not combined:
-        return {"response": "I could not find any relevant documents in the knowledge base to answer your question."}
+    with engine.begin() as db:
+        if is_kin and subject and relation:
+            names, srcs, prov = answer_with_sql(db, subject, relation)
+            if names:
+                if not remainder or not remainder.strip():
+                    # Pure kinship -> return immediately
+                    return {
+                        "response": ", ".join(names),
+                        "stage": "sql_only",
+                        "sources": srcs,
+                        "provenance": prov,
+                        "relevant_documents": [],
+                    }
+                # Composite question -> carry forward a known fact for Stage 2
+                known_fact = f"{subject}'s {relation} is {', '.join(names)}."
+                sql_sources = srcs
 
-    max_context = 100
-    context_pool = combined[:max_context]
-    relevant = combined[:request_body.limit]
-    documents_text = "\n\n".join([f"Title: {p.title}\nAuthors: {p.authors}\nAbstract: {p.abstract}" for p in relevant])
+        # ---- Stage 2: RAG over stories only (rag_story_docs_v) ---------------
+        effective_q = user_q if not known_fact else f"{user_q}\n\nKnown facts:\n- {known_fact}"
+        try:
+            q_vec = embed_query(effective_q)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Embedding error: {e}")
 
-    # 3) Graph fallback if it was a relation question but SQL empty
-    if person and rel and not sql_names_found:
-        G, nick_map = build_graph_from_chunks(context_pool)
-        candidate_persons = expand_person_candidates(person, G, nick_map)
-        all_answers, all_sources = set(), set()
-        for cand in candidate_persons:
-            ans, srcs2 = answer_from_graph(G, cand, rel)
-            all_answers.update(ans); all_sources.update(srcs2)
-        if all_answers:
-            return {
-                "response": ", ".join(sorted(all_answers)),
-                "llm_used": "graph",
-                "sources": sorted(all_sources),
-                "relevant_documents": [{"title": p.title, "authors": p.authors, "url": p.url} for p in relevant],
-            }
+        k = 8
+        rows = db.execute(text("""
+            SELECT id, title, content, url,
+                   1.0 - (embedding <=> :qvec) AS score
+              FROM rag_story_docs_v
+             WHERE embedding IS NOT NULL
+             ORDER BY embedding <-> :qvec
+             LIMIT :k
+        """), {"qvec": q_vec, "k": k}).mappings().all()
 
-    # 4) LLM fallback (guarded)
-    provider = LLM_PROVIDER or ("gemini" if gemini_model else ("openai" if openai_client else ""))
+    hits = [
+        {
+            "doc_id": r["id"],
+            "title": r["title"],
+            "content": r["content"] or "",
+            "url": r["url"],
+            "score": float(r["score"]),
+        }
+        for r in rows
+    ]
+
+    if not hits:
+        # No documents to support an answer
+        return {
+            "response": "I don't know based on the provided documents.",
+            "stage": "none",
+            "sources": sql_sources,
+            "relevant_documents": [],
+            "augmented_query": effective_q,
+        }
+
+    stage = "sql+rag" if known_fact else "rag"
+
+    # Build the exact same augmented prompt style you showed
+    top = hits[:5]
+    documents_text = "\n\n".join(
+        f"Title: {h['title']}\n{(h['content'] or '')[:1200]}"
+        for h in top
+    )
 
     augmented_prompt = (
         "You are a factual QA assistant.\n"
-        "RULES:\n"
+        "\"RULES:\"\n"
         "1) Answer ONLY with facts from the Documents.\n"
         "2) You may infer an inverse family relationship if one direction is explicitly stated.\n"
         "3) If the Documents are insufficient, reply exactly: \"I don't know based on the provided documents.\"\n"
@@ -957,8 +1030,13 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
         f"{documents_text}\n"
         "```\n\n"
         "Question:\n"
-        f"{request_body.query}\n" + (f"\nKnown facts:\n- {known_fact}\n" if known_fact else "")
+        f"{request_body.query}\n"
+        + (f"\nKnown facts:\n- {known_fact}\n" if known_fact else "")
     )
+
+    # ---- Stage 3: LLM composition (same pattern you already use) ------------
+    answer_text = "I don't know based on the provided documents."
+    llm_used = None
 
     try:
         if provider == "openai" and openai_client:
@@ -970,42 +1048,23 @@ async def query_data(request_body: QueryRequest, db: SessionLocal = Depends(get_
                     {"role": "user", "content": augmented_prompt},
                 ],
             )
-            answer = c.choices[0].message.content
+            answer_text = c.choices[0].message.content
             llm_used = "openai:gpt-3.5-turbo"
-        elif provider == "gemini" and gemini_model:
-            gen_cfg = {"temperature": 0.0, "top_p": 0.1, "top_k": 1, "max_output_tokens": 512}
-            g = gemini_model.generate_content(augmented_prompt, generation_config=gen_cfg)
-            answer = g.text
-            llm_used = "gemini-2.0-flash"
         else:
-            if gemini_model:
-                gen_cfg = {"temperature": 0.0, "top_p": 0.1, "top_k": 1, "max_output_tokens": 512}
-                g = gemini_model.generate_content(augmented_prompt, generation_config=gen_cfg)
-                answer = g.text
-                llm_used = "gemini-2.0-flash"
-            elif openai_client:
-                c = openai_client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    temperature=0.0,
-                    messages=[
-                        {"role": "system", "content": "Follow the user's RULES exactly."},
-                        {"role": "user", "content": augmented_prompt},
-                    ],
-                )
-                answer = c.choices[0].message.content
-                llm_used = "openai:gpt-3.5-turbo"
-            else:
-                return {"response": "No LLM configured.", "llm_used": None}
-        return {
-            "response": answer,
-            "llm_used": llm_used,
-            "relevant_documents": [{"title": p.title, "authors": p.authors, "url": p.url} for p in relevant],
-        }
+            # If you support other providers (e.g., Gemini), add those branches here.
+            llm_used = "none"
+            # Leave the default 'I don't know...' if no provider is configured.
     except Exception as e:
-        logger.error(f"LLM generation error: {e}")
-        return {
-            "response": "LLM error",
-            "error": str(e),
-            "llm_used": None,
-            "relevant_documents": [{"title": p.title, "authors": p.authors, "url": p.url} for p in relevant],
-        }
+        answer_text = f"I don't know based on the provided documents. (LLM error: {e})"
+        llm_used = "error"
+
+    return {
+        "response": answer_text,
+        "stage": stage,
+        "llm_used": llm_used,
+        "sources": sql_sources,
+        "relevant_documents": [
+            {"title": h["title"], "url": h["url"], "score": h["score"]} for h in top
+        ],
+        "augmented_query": effective_q,
+    }
