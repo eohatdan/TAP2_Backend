@@ -980,12 +980,16 @@ def query(request_body: "QueryRequest") -> Dict[str, Any]:  # keep your existing
 
         k = 8
         rows = db.execute(text("""
-            SELECT id, title, content, url,
-                   1.0 - (embedding <=> :qvec) AS score
-              FROM rag_story_docs_v
-             WHERE embedding IS NOT NULL
-             ORDER BY embedding <-> :qvec
-             LIMIT :k
+           SELECT
+              id,
+              title,
+              COALESCE(content, abstract, '') AS content,
+              url,
+              1.0 - (embedding <=> (%(qvec)s)::vector) AS score
+            FROM rag_story_docs_v
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> (%(qvec)s)::vector
+            LIMIT %(k)s;
         """), {"qvec": q_vec, "k": k}).mappings().all()
 
     hits = [
